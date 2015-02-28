@@ -164,7 +164,7 @@
 		compatible = "regulator-fixed";
 		regulator-name = "usb2_otg_sw";
 		gpio = <&pm8941_gpios 18 0>;
-		vin-supply = <&pm8941_boost>;
+		parent-supply = <&pm8941_boost>;
 		startup-delay-us = <17000>;
 		enable-active-high;
 	};
