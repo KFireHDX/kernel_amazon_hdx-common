@@ -18,7 +18,6 @@
 #include <linux/suspend.h>
 
 #include <trace/events/sched.h>
-#include <linux/havok.h>
 
 #ifdef CONFIG_SMP
 /* Serializes the updates to cpu_online_mask, cpu_present_mask */
@@ -274,10 +273,6 @@ out_release:
 	trace_sched_cpu_hotplug(cpu, err, 0);
 	if (!err)
 		cpu_notify_nofail(CPU_POST_DEAD | mod, hcpu);
-	/* ACOS_MOD_START */
-	if (!err)
-		HV_PWR(1, 1, cpu, 0);
-	/* ACOS_MOD_END */
 	return err;
 }
 
@@ -332,10 +327,6 @@ static int __cpuinit _cpu_up(unsigned int cpu, int tasks_frozen)
 out_notify:
 	if (ret != 0)
 		__cpu_notify(CPU_UP_CANCELED | mod, hcpu, nr_calls, NULL);
-	/* ACOS_MOD_START */
-	else
-		HV_PWR(1, 1, cpu, 1);
-	/* ACOS_MOD_END */
 	cpu_hotplug_done();
 	trace_sched_cpu_hotplug(cpu, ret, 1);
 
@@ -657,10 +648,12 @@ void set_cpu_present(unsigned int cpu, bool present)
 
 void set_cpu_online(unsigned int cpu, bool online)
 {
-	if (online)
+	if (online) {
 		cpumask_set_cpu(cpu, to_cpumask(cpu_online_bits));
-	else
+		cpumask_set_cpu(cpu, to_cpumask(cpu_active_bits));
+	} else {
 		cpumask_clear_cpu(cpu, to_cpumask(cpu_online_bits));
+	}
 }
 
 void set_cpu_active(unsigned int cpu, bool active)

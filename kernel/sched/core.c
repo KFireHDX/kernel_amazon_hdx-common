@@ -86,7 +86,6 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
-#include <linux/trapz.h>   /* ACOS_MOD_ONELINE */
 
 ATOMIC_NOTIFIER_HEAD(migration_notifier_head);
 
@@ -1607,11 +1606,11 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 {
 	unsigned long flags;
 	int cpu, src_cpu, success = 0;
+	int notify = 0;
 
 	smp_wmb();
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	src_cpu = task_cpu(p);
-	cpu = src_cpu;
+	src_cpu = cpu = task_cpu(p);
 
 	if (!(p->state & state))
 		goto out;
@@ -1653,6 +1652,9 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		p->sched_class->task_waking(p);
 
 	cpu = select_task_rq(p, SD_BALANCE_WAKE, wake_flags);
+
+	/* Refresh src_cpu as it could have changed since we last read it */
+	src_cpu = task_cpu(p);
 	if (src_cpu != cpu) {
 		wake_flags |= WF_MIGRATED;
 		set_task_cpu(p, cpu);
@@ -1662,10 +1664,13 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	ttwu_queue(p, cpu);
 stat:
 	ttwu_stat(p, cpu, wake_flags);
+
+	if (src_cpu != cpu && task_notify_on_migrate(p))
+		notify = 1;
 out:
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 
-	if (src_cpu != cpu && task_notify_on_migrate(p))
+	if (notify)
 		atomic_notifier_call_chain(&migration_notifier_head,
 					   cpu, (void *)src_cpu);
 	return success;
@@ -2084,21 +2089,6 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next)
 {
 	struct mm_struct *mm, *oldmm;
-	/* ACOS_MOD_BEGIN */
-#ifdef CONFIG_TRAPZ_TP
-	/* The context switch is very chatty.  By stuffing the info into the
-	 * lower 8 bits of extra 1 and 2, only one trapz record is used This
-	 * is because values <= 255 only use the 'mini' extras built into
-	 * the main record.
-	 */
-	int trapz_e1 = next->pid & 0xff;
-	int trapz_e2 = (next->pid >> 8) & 0xff;
-	TRAPZ_DESCRIBE(TRAPZ_KERN_SCHED, CtxSw,
-			"Logs prev and next pids on a context switch.");
-	TRAPZ_LOG(TRAPZ_LOG_VERBOSE, 0, TRAPZ_KERN_SCHED, CtxSw,
-			trapz_e1, trapz_e2, 0, 0);
-#endif /* CONFIG_TRAPZ_TP */
-	/* ACOS_MOD_END */
 
 	prepare_task_switch(rq, prev, next);
 
@@ -5523,7 +5513,6 @@ static int __cpuinit sched_cpu_active(struct notifier_block *nfb,
 				      unsigned long action, void *hcpu)
 {
 	switch (action & ~CPU_TASKS_FROZEN) {
-	case CPU_STARTING:
 	case CPU_DOWN_FAILED:
 		set_cpu_active((long)hcpu, true);
 		return NOTIFY_OK;
@@ -6934,9 +6923,6 @@ void __init sched_init_smp(void)
 
 	hotcpu_notifier(cpuset_cpu_active, CPU_PRI_CPUSET_ACTIVE);
 	hotcpu_notifier(cpuset_cpu_inactive, CPU_PRI_CPUSET_INACTIVE);
-
-	/* RT runtime code needs to handle some hotplug events */
-	hotcpu_notifier(update_runtime, 0);
 
 	init_hrtick();
 

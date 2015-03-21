@@ -26,7 +26,7 @@
 		CALL(sys_mknod)
 /* 15 */	CALL(sys_chmod)
 		CALL(sys_lchown16)
-		CALL(sys_hv)			// ACOS_MOD_ONELINE
+		CALL(sys_ni_syscall)		/* was sys_break */
 		CALL(sys_ni_syscall)		/* was sys_stat */
 		CALL(sys_lseek)
 /* 20 */	CALL(sys_getpid)
@@ -107,7 +107,7 @@
 /* 95 */	CALL(sys_fchown16)
 		CALL(sys_getpriority)
 		CALL(sys_setpriority)
-		CALL(sys_trapz)	/* was sys_profil */
+		CALL(sys_ni_syscall)		/* was sys_profil */
 		CALL(sys_statfs)
 /* 100 */	CALL(sys_fstatfs)
 		CALL(sys_ni_syscall)		/* sys_ioperm */

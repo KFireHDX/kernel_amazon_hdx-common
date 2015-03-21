@@ -33,11 +33,3 @@ config GENERIC_CLOCKEVENTS_BUILD
 
 config GENERIC_CLOCKEVENTS_MIN_ADJUST
 	bool
-
-config SUSPEND_TIME
-	bool "Log time spent in suspend"
-	depends on DEBUG_FS
-	---help---
-	  Prints the time spent in suspend in the kernel log, and
-	  keeps statistics on the time spent in suspend in
-	  /sys/kernel/debug/suspend_time

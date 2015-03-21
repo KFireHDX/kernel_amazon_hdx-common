@@ -130,13 +130,6 @@ config PM_WAKELOCKS_GC
 	depends on PM_WAKELOCKS
 	default y
 
-config PM_WAKELOCKS_ACTIVE_CHECK
-	def_bool n
-	depends on PM_WAKELOCKS
-	---help---
-	Enabled by CONFIG_NETFILTER_XT_QTAGUID_PSTATS in order to get user
-	space wakelock active check. This should never appear in menuconfig.
-
 config PM_RUNTIME
 	bool "Run-time PM core functionality"
 	depends on !IA64_HP_SIM
@@ -277,3 +270,10 @@ config PM_GENERIC_DOMAINS_RUNTIME
 config CPU_PM
 	bool
 	depends on SUSPEND || CPU_IDLE
+
+config SUSPEND_TIME
+	bool "Log time spent in suspend"
+	---help---
+	  Prints the time spent in suspend in the kernel log, and
+	  keeps statistics on the time spent in suspend in
+	  /sys/kernel/debug/suspend_time

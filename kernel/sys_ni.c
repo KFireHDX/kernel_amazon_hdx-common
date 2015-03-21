@@ -194,7 +194,6 @@ cond_syscall(sys_eventfd2);
 
 /* performance counters: */
 cond_syscall(sys_perf_event_open);
-cond_syscall(sys_trapz);
 
 /* fanotify! */
 cond_syscall(sys_fanotify_init);
@@ -204,4 +203,3 @@ cond_syscall(sys_fanotify_mark);
 cond_syscall(sys_name_to_handle_at);
 cond_syscall(sys_open_by_handle_at);
 cond_syscall(compat_sys_open_by_handle_at);
-cond_syscall(sys_hv);		/* ACOS_MOD_ONELINE */

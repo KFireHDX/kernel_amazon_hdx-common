@@ -20,11 +20,6 @@
 #include <linux/time.h>
 #include <linux/tick.h>
 #include <linux/stop_machine.h>
-#include <linux/havok.h>
-#include <linux/slab.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#include <linux/pm_wakeup.h>
 
 /* Structure holding internal timekeeping values. */
 struct timekeeper {
@@ -91,19 +86,7 @@ __cacheline_aligned_in_smp DEFINE_SEQLOCK(xtime_lock);
 /* flag for if timekeeping is suspended */
 int __read_mostly timekeeping_suspended;
 
-/* suspend time bins to be exported in debug fs */
-#ifdef CONFIG_SUSPEND_TIME
 
-#define MAX_SUSP_CYCLES		(512)
-static unsigned int time_in_suspend_bins[32];
-struct suspend_cycles {
-	ktime_t *cyc;
-	unsigned int idx;
-	struct wakeup_source ws;
-};
-
-static struct suspend_cycles cycles;
-#endif
 
 /**
  * timekeeper_setup_internals - Set up internals to use clocksource clock.
@@ -577,26 +560,6 @@ void __attribute__((weak)) read_persistent_clock(struct timespec *ts)
 }
 
 /**
- * read_android_elapsed -  Return time from the persistent clock.
- *
- * Weak dummy function for android alarm driver so timkeeping knows about
- * ELAPSED time being used by Android which unfortunately is not based on
- * CLOCK_BOOTIME at the moment. This is only intended to track suspend cycles
- * right now.
- *
- * Reads the ELAPSED time from android alarm driver if it exists.
- * Returns timespec with tv_sec and tv_nsec set to 0 if unsupported.
- *
- *  FIXME: ssp
- *  FWKFOUR-17352: Do be sure to remove this once the task is resolved
- */
-void __attribute__((weak)) read_android_elapsed(struct timespec *ts)
-{
-	ts->tv_sec = 0;
-	ts->tv_nsec = 0;
-}
-
-/**
  * read_boot_clock -  Return time of the system start.
  *
  * Weak dummy function for arches that do not yet support it.
@@ -703,55 +666,11 @@ void timekeeping_inject_sleeptime(struct timespec *delta)
 	timekeeping_update(true);
 
 	write_sequnlock_irqrestore(&timekeeper.lock, flags);
-	/* Mark new sleep delta */
-	HV_TIME_OFFSET(delta);  /* ACOS_MOD_ONELINE */
 
 	/* signal hrtimers about time change */
 	clock_was_set();
 }
 
-
-#ifdef CONFIG_SUSPEND_TIME
-/**
- * timekeeping_record_susp_cycle - records suspend cycle duration
- *
- * This is for tracking suspend times in /d/suspend_cycles which
- * will be collected by batterystats and shown on the a timeline
- * in bugreport for standby power analysis
- *
- * This to be called only from timekeeping suspend/resume syscore ops
- * Hence the lack of any locks around cycles
- */
-
-static void timekeeping_record_susp_cycle(void)
-{
-	struct timespec ts;
-
-	if (unlikely(cycles.cyc == NULL))
-		goto out;
-
-	if (unlikely(cycles.idx >= (2 * MAX_SUSP_CYCLES))) {
-		pr_warn("%s: suspend cycles overflow detected\n", __func__);
-		goto out;
-	}
-
-	read_android_elapsed(&ts);
-
-	/* Fall back to boot time if read_android_elapsed is
-	 * not implemented
-	 */
-	if (unlikely(timespec_to_ns(&ts) == (s64)0))
-		get_monotonic_boottime(&ts);
-
-	cycles.cyc[cycles.idx++] = timespec_to_ktime(ts);
-out:
-	return;
-}
-#else
-
-#define timekeeping_record_susp_cycle()	do { } while (0)
-
-#endif /* !CONFIG_SUSPEND_TIME */
 
 /**
  * timekeeping_resume - Resumes the generic timekeeping subsystem.
@@ -817,12 +736,8 @@ static void timekeeping_resume(void)
 		suspendtime_found = true;
 	}
 
-	if (suspendtime_found) {
-#ifdef CONFIG_SUSPEND_TIME
-		time_in_suspend_bins[fls(ts_delta.tv_sec)]++;
-#endif
+	if (suspendtime_found)
 		__timekeeping_inject_sleeptime(&ts_delta);
-	}
 
 	/* Re-base the last cycle value */
 	clock->cycle_last = cycle_now;
@@ -830,10 +745,6 @@ static void timekeeping_resume(void)
 	timekeeping_suspended = 0;
 	timekeeping_update(false);
 	write_sequnlock_irqrestore(&timekeeper.lock, flags);
-
-	/* Mark resume */
-	HV_LOG_RESUME();  /* ACOS_MOD_ONELINE */
-	timekeeping_record_susp_cycle();
 
 	touch_softlockup_watchdog();
 
@@ -849,9 +760,6 @@ static int timekeeping_suspend(void)
 	struct timespec		delta, delta_delta;
 	static struct timespec	old_delta;
 
-	/* Mark suspend */
-	HV_LOG_SUSPEND();  /* ACOS_MOD_ONELINE */
-	timekeeping_record_susp_cycle();
 	read_persistent_clock(&timekeeping_suspend_time);
 
 	write_seqlock_irqsave(&timekeeper.lock, flags);
@@ -891,135 +799,12 @@ static struct syscore_ops timekeeping_syscore_ops = {
 	.suspend	= timekeeping_suspend,
 };
 
-#ifdef CONFIG_SUSPEND_TIME
-static int suspend_time_debug_show(struct seq_file *s, void *data)
-{
-	int bin;
-	seq_printf(s, "time (secs)  count\n");
-	seq_printf(s, "------------------\n");
-	for (bin = 0; bin < 32; bin++) {
-		if (time_in_suspend_bins[bin] == 0)
-			continue;
-		seq_printf(s, "%4d - %4d %4u\n",
-			bin ? 1 << (bin - 1) : 0, 1 << bin,
-				time_in_suspend_bins[bin]);
-	}
-	return 0;
-}
-
-static int suspend_time_debug_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, suspend_time_debug_show, NULL);
-}
-
-static const struct file_operations suspend_time_debug_fops = {
-	.open		= suspend_time_debug_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static ssize_t suspend_total_time_read(struct file *file, char __user *buf,
-	size_t size, loff_t *pos)
-{
-	struct timespec t;
-	unsigned long seq;
-
-	if (*pos)
-		return 0;
-
-	do {
-		seq = read_seqbegin(&timekeeper.lock);
-		t = timekeeper.total_sleep_time;
-	} while (read_seqretry(&timekeeper.lock, seq));
-
-	*pos += snprintf(buf, size, "%lu.%03lu\n",
-		t.tv_sec, t.tv_nsec / NSEC_PER_MSEC);
-
-	return *pos;
-}
-
-static const struct file_operations suspend_total_time_debug_fops = {
-	.read = suspend_total_time_read,
-};
-
-static ssize_t suspend_cycles_clear(struct file *file, const char __user *buf,
-		size_t size, loff_t *pos)
-{
-	__pm_stay_awake(&cycles.ws);
-	cycles.idx = 0;
-	__pm_relax(&cycles.ws);
-
-	return size;
-}
-
-static int suspend_cycles_debug_show(struct seq_file *s, void *data)
-{
-	unsigned int i;
-
-	__pm_stay_awake(&cycles.ws);
-	seq_printf(s, "Suspend Cycles start - end\n");
-	seq_printf(s, "----------------------------\n");
-	for (i = 0; i < cycles.idx; i += 2) {
-		seq_printf(s, "%lld - %lld\n",
-			ktime_to_ms(cycles.cyc[i]),
-			ktime_to_ms(cycles.cyc[i + 1]));
-	}
-	__pm_relax(&cycles.ws);
-	return 0;
-}
-
-static int suspend_cycles_debug_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, suspend_cycles_debug_show, NULL);
-}
-
-static const struct file_operations suspend_cycles_debug_fops = {
-	.open		= suspend_cycles_debug_open,
-	.read		= seq_read,
-	.write		= suspend_cycles_clear,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-#endif /* CONFIG_SUSPEND_TIME */
-
 static int __init timekeeping_init_ops(void)
 {
-#ifdef CONFIG_SUSPEND_TIME
-	struct dentry *d1, *d2, *d3;
-
-	d1 = debugfs_create_file("suspend_time", 0644, NULL, NULL,
-		&suspend_time_debug_fops);
-	if (!d1)
-		pr_warn("Failed to create suspend_time debug file\n");
-
-	d2 = debugfs_create_file("suspend_total_time", 0644, NULL, NULL,
-		&suspend_total_time_debug_fops);
-	if (!d2)
-		pr_warn("Failed to create suspend_total_time debug file\n");
-
-	/* Let anyone read/write to the file */
-	d3 = debugfs_create_file("suspend_cycles", 0666, NULL, NULL,
-			&suspend_cycles_debug_fops);
-	if (!d3) {
-		pr_warn("Failed to create suspend_cycles debug file\n");
-		goto out;
-	}
-
-	cycles.cyc = kzalloc((2 * sizeof(ktime_t) * MAX_SUSP_CYCLES),
-			GFP_KERNEL);
-	if (!cycles.cyc) {
-		debugfs_remove(d3);
-		goto out;
-	}
-	cycles.idx = 0;
-	wakeup_source_init(&cycles.ws, "susp-cyc-counter");
-out:
-#endif
 	register_syscore_ops(&timekeeping_syscore_ops);
 	return 0;
 }
+
 device_initcall(timekeeping_init_ops);
 
 /*
@@ -1401,7 +1186,7 @@ void get_monotonic_boottime(struct timespec *ts)
 	} while (read_seqretry(&timekeeper.lock, seq));
 
 	set_normalized_timespec(ts, ts->tv_sec + tomono.tv_sec + sleep.tv_sec,
-			ts->tv_nsec + tomono.tv_nsec + sleep.tv_nsec + nsecs);
+		(s64)ts->tv_nsec + tomono.tv_nsec + sleep.tv_nsec + nsecs);
 }
 EXPORT_SYMBOL_GPL(get_monotonic_boottime);
 
