@@ -670,8 +670,8 @@ done:
 }
 
 static struct class_attribute gpio_class_attrs[] = {
-	__ATTR(export, 0220, NULL, export_store),
-	__ATTR(unexport, 0220, NULL, unexport_store),
+	__ATTR(export, 0200, NULL, export_store),
+	__ATTR(unexport, 0200, NULL, unexport_store),
 	__ATTR_NULL,
 };
 
