@@ -26,7 +26,6 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/udp.h>
-#include <linux/havok.h>  /* ACOS_MOD_ONELINE */
 
 #if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
 #include <linux/netfilter_ipv6/ip6_tables.h>
@@ -1473,10 +1472,6 @@ static void if_tag_stat_update(const char *ifname, uid_t uid,
 		 * Updating the {acct_tag, uid_tag} entry handles both stats:
 		 * {0, uid_tag} will also get updated.
 		 */
-		/* ACOS_MOD_BEGIN */
-		if (!strcmp(ifname, "wlan0"))
-			HV_DUMP_DATA(HV_WIFI, (int)direction, bytes);
-		/* ACOS_MOD_END */
 		tag_stat_update(tag_stat_entry, direction, proto, bytes);
 		spin_unlock_bh(&iface_entry->tag_stat_list_lock);
 		return;

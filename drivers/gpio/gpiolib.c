@@ -11,7 +11,6 @@
 #include <linux/of_gpio.h>
 #include <linux/idr.h>
 #include <linux/slab.h>
-#include <linux/havok.h>   /* ACOS_MOD_ONELINE */
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/gpio.h>
@@ -311,10 +310,6 @@ static ssize_t gpio_value_store(struct device *dev,
 		if (status == 0) {
 			if (test_bit(FLAG_ACTIVE_LOW, &desc->flags))
 				value = !value;
-			/* ACOS_MOD_BEGIN */
-			if (gpio == 95)
-				HV_CNTL(0, 3 + (int)value, 0, 0);
-			/* ACOS_MOD_END */
 			gpio_set_value_cansleep(gpio, value != 0);
 			status = size;
 		}

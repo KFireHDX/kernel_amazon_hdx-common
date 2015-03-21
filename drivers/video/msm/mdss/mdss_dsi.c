@@ -26,7 +26,6 @@
 #include "mdss_panel.h"
 #include "mdss_dsi.h"
 #include "mdss_debug.h"
-#include <linux/havok.h>
 
 #if defined(CONFIG_MACH_URSA)
 static int mdss_dsi_regulator_init(struct platform_device *pdev)
@@ -631,7 +630,6 @@ static int mdss_dsi_off(struct mdss_panel_data *pdata)
 
 	mdss_dsi_clk_ctrl(ctrl_pdata, 0);
 
-	HV_LOG_PANEL_STATE(0);   /* ACOS_MOD_ONELINE */
 	ret = mdss_dsi_panel_power_on(pdata, 0);
 	if (ret) {
 		pr_err("%s: Panel power off failed\n", __func__);
@@ -905,7 +903,6 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 		return ret;
 	}
 	pdata->panel_info.panel_power_on = 1;
-	HV_LOG_PANEL_STATE(1);   /* ACOS_MOD_ONELINE */
 
 	mdss_dsi_phy_sw_reset((ctrl_pdata->ctrl_base));
 	mdss_dsi_phy_init(pdata);

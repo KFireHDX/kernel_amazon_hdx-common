@@ -24,8 +24,6 @@
 #include "mdss_panel.h"
 #include "mdss_dsi.h"
 
-#include <linux/trapz.h> /* ACOS_MOD_ONELINE {trapz tracepoint} */
-
 /* wait for at least 2 vsyncs for lowest refresh rate (24hz) */
 #define VSYNC_TIMEOUT_US 100000
 
@@ -466,11 +464,6 @@ static void mdss_mdp_video_vsync_intr_done(void *arg)
 	struct mdss_mdp_vsync_handler *tmp;
 	ktime_t vsync_time;
 
-	/* ACOS_MOD_BEGIN {trapz tracepoint} */
-	TRAPZ_DESCRIBE(TRAPZ_KERN_DISP, Vsyncirq, "Primary VSYNC interrupt");
-	TRAPZ_LOG(TRAPZ_LOG_DEBUG, TRAPZ_CAT_KERNEL, TRAPZ_KERN_DISP,
-			Vsyncirq, 0, 0, 0, 0);
-	/* ACOS_MOD_END {trapz tracepoint} */
 	if (!ctx) {
 		pr_err("invalid ctx\n");
 		return;

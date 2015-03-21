@@ -25,7 +25,6 @@
 #include <linux/qpnp/power-on.h>
 #include <linux/io.h>
 #include <mach/socinfo.h>
-#include <linux/metricslog.h>
 
 /* Common PNP defines */
 #define QPNP_PON_REVISION2(base)		(base + 0x01)

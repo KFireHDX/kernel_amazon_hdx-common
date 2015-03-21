@@ -26,7 +26,6 @@
 #endif
 
 #include "mdss_dsi.h"
-#include <linux/havok.h>
 
 #define DT_CMD_HDR 6
 
@@ -522,7 +521,6 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 
 	switch (ctrl_pdata->bklt_ctrl) {
 	case BL_WLED:
-		HV_PWR(1, 2, 0, (int)(bl_level >> 3));  /* ACOS_MOD_ONELINE */
 		led_trigger_event(bl_led_trigger, bl_level);
 #if defined(CONFIG_ARCH_MSM8974_APOLLO) || defined(CONFIG_ARCH_MSM8974_THOR)
                 lp855x_bl_set(bl_level);

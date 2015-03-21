@@ -39,7 +39,6 @@
 #include <dma-coherence.h>
 #endif
 
-#include <linux/trapz.h>   /* ACOS_MOD_ONELINE */
 /*
  *  Compatibility
  */
@@ -2653,14 +2652,6 @@ static int snd_pcm_playback_ioctl1(struct file *file,
 			return -EFAULT;
 		result = snd_pcm_lib_write(substream, xferi.buf, xferi.frames);
 		__put_user(result, &_xferi->result);
-
-		/** ACOS_MOD_BEGIN **/
-		TRAPZ_DESCRIBE(TRAPZ_KERN_SND,
-			PcmWrite, "Logs ioctl writes to PCM sound device");
-		TRAPZ_LOG(TRAPZ_LOG_VERBOSE,
-			0, TRAPZ_KERN_SND, PcmWrite, cmd, 0, 0, 0);
-		/** ACOS_MODE_END **/
-
 		return result < 0 ? result : 0;
 	}
 	case SNDRV_PCM_IOCTL_WRITEN_FRAMES:
