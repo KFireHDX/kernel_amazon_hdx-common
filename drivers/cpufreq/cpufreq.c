@@ -1301,23 +1301,11 @@ EXPORT_SYMBOL(cpufreq_quick_get_max);
 
 static unsigned int __cpufreq_get(unsigned int cpu)
 {
-	struct cpufreq_policy *policy;
-	unsigned long flags;
+	struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
 	unsigned int ret_freq = 0;
 
-	if (cpu >= nr_cpu_ids)
-		goto err_out;
-
-	spin_lock_irqsave(&cpufreq_driver_lock, flags);
-
-	/* Get the CPU policy. */
-	policy = per_cpu(cpufreq_cpu_data, cpu);
-
-	if (!policy)
-		goto err_out_unlock;
-
-	if (!cpufreq_driver || !cpufreq_driver->get)
-		goto err_out_unlock;
+	if (!cpufreq_driver->get)
+		return ret_freq;
 
 	ret_freq = cpufreq_driver->get(cpu);
 
@@ -1331,10 +1319,6 @@ static unsigned int __cpufreq_get(unsigned int cpu)
 		}
 	}
 
-err_out_unlock:
-	spin_unlock_irqrestore(&cpufreq_driver_lock, flags);
-
-err_out:
 	return ret_freq;
 }
 
