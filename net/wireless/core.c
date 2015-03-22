@@ -325,10 +325,7 @@ static void cfg80211_event_work(struct work_struct *work)
 
 struct wiphy *wiphy_new(const struct cfg80211_ops *ops, int sizeof_priv)
 {
-	/* ACOS_MOD_BEGIN */
-	/* THOR-5411 change */
-	/* static int wiphy_counter; */
-	/* ACOS_MOD_END */
+	static int wiphy_counter;
 
 	struct cfg80211_registered_device *rdev;
 	int alloc_size;
@@ -352,17 +349,10 @@ struct wiphy *wiphy_new(const struct cfg80211_ops *ops, int sizeof_priv)
 
 	mutex_lock(&cfg80211_mutex);
 
-	/* ACOS_MOD_BEGIN */
-	/* THOR-5411 change */
-	/* rdev->wiphy_idx = wiphy_counter++; */
-	rdev->wiphy_idx = 0;
-	/* ACOS_MOD_END */
+	rdev->wiphy_idx = wiphy_counter++;
 
 	if (unlikely(!wiphy_idx_valid(rdev->wiphy_idx))) {
-		/* ACOS_MOD_BEGIN */
-		/* THOR-5411 change */
-		/* wiphy_counter--; */
-		/* ACOS_MOD_END */
+		wiphy_counter--;
 		mutex_unlock(&cfg80211_mutex);
 		/* ugh, wrapped! */
 		kfree(rdev);

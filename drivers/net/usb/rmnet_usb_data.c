@@ -21,7 +21,6 @@
 #include <linux/usb/usbnet.h>
 #include <linux/msm_rmnet.h>
 
-#include <linux/kobject.h>
 #include "rmnet_usb.h"
 
 #define RMNET_DATA_LEN			2000
@@ -150,7 +149,6 @@ static int rmnet_usb_suspend(struct usb_interface *iface, pm_message_t message)
 {
 	struct usbnet		*unet = usb_get_intfdata(iface);
 	struct rmnet_ctrl_dev	*dev;
-	char *suspended[2]   = {"QMI_STATE=SUSPENDED", NULL};
 	int			i, n, rdev_cnt, unet_id;
 	int			retval = 0;
 
@@ -193,8 +191,6 @@ static int rmnet_usb_suspend(struct usb_interface *iface, pm_message_t message)
 		netif_device_attach(unet->net);
 	}
 
-	kobject_uevent_env(&dev->devicep->kobj, KOBJ_CHANGE,
-					   suspended);
 	return 0;
 
 abort_suspend:
@@ -216,7 +212,6 @@ static int rmnet_usb_resume(struct usb_interface *iface)
 {
 	struct usbnet		*unet = usb_get_intfdata(iface);
 	struct rmnet_ctrl_dev	*dev;
-	char *resumed[2]   = {"QMI_STATE=RESUMED", NULL};
 	int			n, rdev_cnt, unet_id;
 
 	rdev_cnt = unet->data[4] ? no_rmnet_insts_per_dev : 1;
@@ -232,25 +227,6 @@ static int rmnet_usb_resume(struct usb_interface *iface)
 		unet->suspend_count = 1;
 		usbnet_resume(iface);
 	}
-
-	kobject_uevent_env(&dev->devicep->kobj, KOBJ_CHANGE,
-					   resumed);
-	return 0;
-}
-
-int rmnet_usb_reset_resume(struct usb_interface *iface)
-{
-	struct usbnet           *unet;
-	struct rmnet_ctrl_dev   *dev;
-
-	char *reset_resume[2]   = {"QMI_STATE=RESET_RESUME", NULL};
-	
-	unet = usb_get_intfdata(iface);
-
-	dev = (struct rmnet_ctrl_dev *)unet->data[1];
-
-	kobject_uevent_env(&dev->devicep->kobj, KOBJ_CHANGE,
-					reset_resume);
 
 	return 0;
 }
@@ -398,8 +374,8 @@ static __be16 rmnet_ip_type_trans(struct sk_buff *skb)
 		protocol = htons(ETH_P_IPV6);
 		break;
 	default:
-		pr_err("rmnet_recv() L3 protocol decode error: 0x%02x",
-		       skb->data[0] & 0xf0);
+		/*pr_err("[%s] rmnet_recv() L3 protocol decode error: 0x%02x",
+		       dev->name, skb->data[0] & 0xf0);*/
 	}
 
 	return protocol;
@@ -493,50 +469,6 @@ static const struct net_device_ops rmnet_usb_ops_ip = {
 	.ndo_validate_addr = 0,
 };
 
-static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
-{
-	struct rmnet_ioctl_extended_s ext_cmd;
-	int rc = 0;
-	struct usbnet *unet = netdev_priv(dev);
-
-	rc = copy_from_user(&ext_cmd, ifr->ifr_ifru.ifru_data,
-			    sizeof(struct rmnet_ioctl_extended_s));
-
-	if (rc) {
-		DBG0("%s(): copy_from_user() failed\n", __func__);
-		return rc;
-	}
-
-	switch (ext_cmd.extended_ioctl) {
-	case RMNET_IOCTL_PM_ENABLE:
-		pm_runtime_allow(unet->intf->dev.parent);
-		DBG0("[%s] rmnet_ioctl(): Enable runtime PM\n", dev->name);
-		break;
-
-	case RMNET_IOCTL_PM_DISABLE:
-		pm_runtime_forbid(unet->intf->dev.parent);
-		DBG0("[%s] rmnet_ioctl(): Disable runtime PM\n", dev->name);
-		break;
-
-	case RMNET_IOCTL_PM_WAKE_ENABLE:
-		unet->intf->needs_remote_wakeup = 1;
-		DBG0("[%s] rmnet_ioctl(): Enable rwake\n", dev->name);
-		break;
-
-	case RMNET_IOCTL_PM_WAKE_DISABLE:
-		unet->intf->needs_remote_wakeup = 0;
-		DBG0("[%s] rmnet_ioctl(): Disable rwake\n", dev->name);
-		break;
-	}
-
-	rc = copy_to_user(ifr->ifr_ifru.ifru_data, &ext_cmd,
-			  sizeof(struct rmnet_ioctl_extended_s));
-
-	if (rc)
-		DBG0("%s(): copy_to_user() failed\n", __func__);
-	return rc;
-}
-
 static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	struct usbnet	*unet = netdev_priv(dev);
@@ -617,13 +549,8 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		DBG0("[%s] rmnet_ioctl(): close transport port\n", dev->name);
 		break;
 
-	case RMNET_IOCTL_EXTENDED:
-		rc = rmnet_ioctl_extended(dev, ifr);
-		break;
-
 	default:
-		dev_err(&unet->intf->dev, "[%s] error: "
-			"rmnet_ioct called for unsupported cmd[%d]",
+		dev_dbg(&unet->intf->dev, "[%s] error: rmnet_ioctl called for unsupported cmd[0x%x]\n",
 			dev->name, cmd);
 		return -EINVAL;
 	}
@@ -815,7 +742,6 @@ static int rmnet_usb_probe(struct usb_interface *iface,
 			dev_dbg(&iface->dev,
 					"mode debugfs file is not available\n");
 	}
-	unet->intf->needs_remote_wakeup = 1;
 
 	usb_enable_autosuspend(udev);
 
@@ -894,26 +820,6 @@ static struct driver_info rmnet_usb_info = {
 	.data          = 1,
 };
 
-static struct driver_info rmnet_info_ernie2 = {
-	.description   = "RmNET net device",
-	.flags         = FLAG_SEND_ZLP,
-	.bind          = rmnet_usb_bind,
-	.tx_fixup      = rmnet_usb_tx_fixup,
-	.rx_fixup      = rmnet_usb_rx_fixup,
-	.manage_power  = rmnet_usb_manage_power,
-	.data          = 0,
-};
-
-static struct driver_info rmnet_info_ernie = {
-	.description   = "RmNET net device",
-	.flags         = FLAG_SEND_ZLP,
-	.bind          = rmnet_usb_bind,
-	.tx_fixup      = rmnet_usb_tx_fixup,
-	.rx_fixup      = rmnet_usb_rx_fixup,
-	.manage_power  = rmnet_usb_manage_power,
-	.data          = 0,
-};
-
 static const struct usb_device_id vidpids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9034, 4),
 	.driver_info = (unsigned long)&rmnet_info,
@@ -963,28 +869,19 @@ static const struct usb_device_id vidpids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9079, 8),
 	.driver_info = (unsigned long)&rmnet_usb_info,
 	},
-	{ USB_DEVICE_AND_INTERFACE_INFO(0x1949, 0x9004,
-	 0xff, 0x06, 0x00),
-	.driver_info = (unsigned long)&rmnet_info_ernie2,
-	},
-	{
-		USB_DEVICE_AND_INTERFACE_INFO(0x1949, 0x9003,
-		0xff, 0x06, 0x00), /* Ernie */
-		.driver_info = (unsigned long)&rmnet_info_ernie,
-	},
+
 	{ }, /* Terminating entry */
 };
 
 MODULE_DEVICE_TABLE(usb, vidpids);
 
 static struct usb_driver rmnet_usb = {
-	.name       = "rmnet",
+	.name       = "rmnet_usb",
 	.id_table   = vidpids,
 	.probe      = rmnet_usb_probe,
 	.disconnect = rmnet_usb_disconnect,
 	.suspend    = rmnet_usb_suspend,
 	.resume     = rmnet_usb_resume,
-	.reset_resume     = rmnet_usb_reset_resume,
 	.supports_autosuspend = true,
 };
 

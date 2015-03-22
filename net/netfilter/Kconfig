@@ -1018,18 +1018,6 @@ config NETFILTER_XT_MATCH_QTAGUID
 
 	  If unsure, say `N'.
 
-config NETFILTER_XT_QTAGUID_PSTATS
-	bool "support to find uids contributing to nw traffic w/o wakelocks"
-	depends on NETFILTER_XT_MATCH_QTAGUID
-	select PM_WAKELOCKS_ACTIVE_CHECK
-	default n
-	help
-	  This option enables support to track nw traffic per uid w/o a user space
-	  wakelock being held. This is purely for debug purposes in order to track
-	  android app/services consuming power with wifi on. This should not be enabled
-	  in a production environment. The data is exported exactly like qtaguid stats
-	  and it can be seen from user space in /proc/net/xt_qtaguid/pstats
-
 config NETFILTER_XT_MATCH_QUOTA
 	tristate '"quota" match support'
 	depends on NETFILTER_ADVANCED
