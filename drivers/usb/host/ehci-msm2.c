@@ -42,11 +42,13 @@
 #include <linux/debugfs.h>
 #include <mach/rpm-regulator.h>
 
-#include <linux/kobject.h>
 #define MSM_USB_BASE (hcd->regs)
 
 #define PDEV_NAME_LEN 20
-#define ALLOW_EHCI_RETENTION BIT(0)
+
+static bool uicc_card_present;
+module_param(uicc_card_present, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uicc_card_present, "UICC card inserted");
 
 struct msm_hcd {
 	struct ehci_hcd				ehci;
@@ -62,7 +64,7 @@ struct msm_hcd {
 	struct regulator			*hsusb_1p8;
 	struct regulator			*vbus;
 	struct msm_xo_voter			*xo_handle;
-	atomic_t				async_int;
+	bool					async_int;
 	bool					vbus_on;
 	atomic_t				in_lpm;
 	int					pmic_gpio_dp_irq;
@@ -80,25 +82,8 @@ struct msm_hcd {
 	bool					wakeup_irq_enabled;
 	int					wakeup_irq;
 	enum usb_vdd_type			vdd_type;
-	unsigned long				flags;
+	void __iomem				*usb_phy_ctrl_reg;
 };
-
-bool wan_present(void)
-{
-       struct device_node *ap;
-       int len;
-	
-       ap = of_find_node_by_path("/idme/board_id");
-       if (ap) {
-               const char *boardid = of_get_property(ap, "value", &len);
-               if (len >= 2) {
-                       if (boardid[0] == '0' && boardid[5] == '1')
-                               return true;
-               }
-       }
-
-       return false;
-}
 
 static inline struct msm_hcd *hcd_to_mhcd(struct usb_hcd *hcd)
 {
@@ -315,8 +300,10 @@ static int msm_ehci_config_vddcx(struct msm_hcd *mhcd, int high)
 static void msm_ehci_vbus_power(struct msm_hcd *mhcd, bool on)
 {
 	int ret;
+	const struct msm_usb_host_platform_data *pdata;
 
-	if(wan_present())
+	pdata = mhcd->dev->platform_data;
+	if (pdata && pdata->is_uicc)
 		return;
 
 	if (!mhcd->vbus) {
@@ -375,25 +362,26 @@ static int msm_ehci_init_vbus(struct msm_hcd *mhcd, int init)
 
 	pdata = mhcd->dev->platform_data;
 
+	/* For uicc card connection, external vbus is not required */
+	if (pdata && pdata->is_uicc)
+		return 0;
+
 	if (!init) {
 		if (pdata && pdata->dock_connect_irq)
 			free_irq(pdata->dock_connect_irq, mhcd);
 		return rc;
 	}
 
-	if(!wan_present()){
-		mhcd->vbus = devm_regulator_get(mhcd->dev, "vbus");
-		ret = PTR_ERR(mhcd->vbus);
-		if (ret == -EPROBE_DEFER) {
-			pr_debug("failed to get vbus handle, defer probe\n");
-			return ret;
-		} else if (IS_ERR(mhcd->vbus)) {
-			pr_err("Unable to get vbus\n");
-			return -ENODEV;
-		}
+	mhcd->vbus = devm_regulator_get(mhcd->dev, "vbus");
+	ret = PTR_ERR(mhcd->vbus);
+	if (ret == -EPROBE_DEFER) {
+		pr_debug("failed to get vbus handle, defer probe\n");
+		return ret;
+	} else if (IS_ERR(mhcd->vbus)) {
+		pr_err("Unable to get vbus\n");
+		return -ENODEV;
 	}
 
-	pr_info("%s: 3\n", __func__);
 	if (pdata) {
 		hcd->power_budget = pdata->power_budget;
 
@@ -407,7 +395,6 @@ static int msm_ehci_init_vbus(struct msm_hcd *mhcd, int init)
 				enable_irq_wake(pdata->dock_connect_irq);
 		}
 	}
-	pr_info("%s: 4, %d\n", __func__, rc);
 	return rc;
 }
 
@@ -597,6 +584,7 @@ static int msm_ehci_phy_reset(struct msm_hcd *mhcd)
 	if (ret)
 		return ret;
 
+	/* Minimum 10msec delay for block reset as per hardware spec */
 	usleep_range(10000, 12000);
 
 	ret = msm_ehci_link_clk_reset(mhcd, 0);
@@ -618,23 +606,22 @@ static int msm_ehci_phy_reset(struct msm_hcd *mhcd)
 
 static void usb_phy_reset(struct msm_hcd *mhcd)
 {
-	struct usb_hcd *hcd = mhcd_to_hcd(mhcd);
 	u32 val;
 
 	/* Assert USB PHY_PON */
-	val =  readl_relaxed(USB_PHY_CTRL2);
+	val =  readl_relaxed(mhcd->usb_phy_ctrl_reg);
 	val &= ~PHY_POR_BIT_MASK;
 	val |= PHY_POR_ASSERT;
-	writel_relaxed(val, USB_PHY_CTRL2);
+	writel_relaxed(val, mhcd->usb_phy_ctrl_reg);
 
-	/* wait for minimum 10 microseconds as suggested in HPG. */
+	/* wait for minimum 10 microseconds as suggested in hardware spec */
 	usleep_range(10, 15);
 
 	/* Deassert USB PHY_PON */
-	val =  readl_relaxed(USB_PHY_CTRL2);
+	val =  readl_relaxed(mhcd->usb_phy_ctrl_reg);
 	val &= ~PHY_POR_BIT_MASK;
 	val |= PHY_POR_DEASSERT;
-	writel_relaxed(val, USB_PHY_CTRL2);
+	writel_relaxed(val, mhcd->usb_phy_ctrl_reg);
 
 	/* Ensure that RESET operation is completed. */
 	mb();
@@ -695,13 +682,6 @@ static int msm_hsusb_reset(struct msm_hcd *mhcd)
 	/*Clear the PHY interrupts by reading the PHY interrupt latch register*/
 	msm_ulpi_read(mhcd, ULPI_USB_INT_LATCH);
 
-	/*disable auto resume*/
-	msm_ulpi_write(mhcd, ULPI_IFC_CTRL_AUTORESUME, ULPI_CLR(ULPI_IFC_CTRL));
-
-	/* Configure USB PHY settings */
-	msm_ulpi_write(mhcd, 0x6A, 0x81);
-	msm_ulpi_write(mhcd, 0x24, 0x82);
-	
 	return 0;
 }
 
@@ -711,16 +691,11 @@ static void msm_ehci_phy_susp_fail_work(struct work_struct *w)
 					phy_susp_fail_work);
 	struct usb_hcd *hcd = mhcd_to_hcd(mhcd);
 
-	pm_runtime_disable(mhcd->dev);
-
 	msm_ehci_vbus_power(mhcd, 0);
 	usb_remove_hcd(hcd);
 	msm_hsusb_reset(mhcd);
 	usb_add_hcd(hcd, hcd->irq, IRQF_SHARED);
 	msm_ehci_vbus_power(mhcd, 1);
-
-	pm_runtime_set_active(mhcd->dev);
-	pm_runtime_enable(mhcd->dev);
 }
 
 #define PHY_SUSP_TIMEOUT_MSEC	500
@@ -733,6 +708,8 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 	unsigned long timeout;
 	int ret;
 	u32 portsc;
+	const struct msm_usb_host_platform_data *pdata;
+	u32 func_ctrl;
 
 	if (atomic_read(&mhcd->in_lpm)) {
 		dev_dbg(mhcd->dev, "%s called in lpm\n", __func__);
@@ -749,6 +726,14 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 		return -EBUSY;
 	}
 
+	pdata = mhcd->dev->platform_data;
+	if (pdata && pdata->is_uicc) {
+		/* put the controller in non-driving mode */
+		func_ctrl = msm_ulpi_read(mhcd, ULPI_FUNC_CTRL);
+		func_ctrl &= ~ULPI_FUNC_CTRL_OPMODE_MASK;
+		func_ctrl |= ULPI_FUNC_CTRL_OPMODE_NONDRIVING;
+		msm_ulpi_write(mhcd, func_ctrl, ULPI_FUNC_CTRL);
+	}
 	/* If port is enabled wait 5ms for PHCD to come up. Reset PHY
 	 * and link if it fails to do so.
 	 * If port is not enabled set the PHCD bit and poll for it to
@@ -788,21 +773,13 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 	 * block data communication from PHY.  Enable asynchronous interrupt
 	 * only when wakeup gpio IRQ is not present.
 	 */
-	//if (mhcd->wakeup_irq)
-	//	writel_relaxed(readl_relaxed(USB_USBCMD) | ULPI_STP_CTRL,
-	//			USB_USBCMD);
-	//else
+	if (mhcd->wakeup_irq)
+		writel_relaxed(readl_relaxed(USB_USBCMD) | ULPI_STP_CTRL,
+				USB_USBCMD);
+	else
 		writel_relaxed(readl_relaxed(USB_USBCMD) | ASYNC_INTR_CTRL |
 				ULPI_STP_CTRL, USB_USBCMD);
 
-	/* Enable retention mode */
-	if (mhcd->flags & ALLOW_EHCI_RETENTION) {
-		u32 phy_ctrl_val;
-		phy_ctrl_val = readl_relaxed(USB_PHY_CTRL);
-		phy_ctrl_val &= ~PHY_RETEN;
-		writel_relaxed(phy_ctrl_val, USB_PHY_CTRL);
-	}
-	
 	/*
 	 * Ensure that hardware is put in low power mode before
 	 * clocks are turned OFF and VDD is allowed to minimize.
@@ -861,13 +838,13 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 	unsigned temp;
 	int ret;
 	unsigned long flags;
+	u32 func_ctrl;
+	const struct msm_usb_host_platform_data *pdata;
 
 	if (!atomic_read(&mhcd->in_lpm)) {
 		dev_dbg(mhcd->dev, "%s called in !in_lpm\n", __func__);
 		return 0;
 	}
-	/* Handles race with Async interrupt */
-	disable_irq(hcd->irq);
 
 	if (mhcd->pmic_gpio_dp_irq_enabled) {
 		disable_irq_wake(mhcd->pmic_gpio_dp_irq);
@@ -908,14 +885,6 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 
 	msm_ehci_config_vddcx(mhcd, 1);
 
-	if (mhcd->flags & ALLOW_EHCI_RETENTION) {
-		u32 phy_ctrl_val;
-		
-		phy_ctrl_val = readl_relaxed(USB_PHY_CTRL);
-		phy_ctrl_val |= PHY_RETEN;
-		writel_relaxed(phy_ctrl_val, USB_PHY_CTRL);
-	}
-
 	temp = readl_relaxed(USB_USBCMD);
 	temp &= ~ASYNC_INTR_CTRL;
 	temp &= ~ULPI_STP_CTRL;
@@ -940,12 +909,20 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 	}
 
 skip_phy_resume:
+	pdata = mhcd->dev->platform_data;
+	if (pdata && pdata->is_uicc) {
+		/* put the controller in normal mode */
+		func_ctrl = msm_ulpi_read(mhcd, ULPI_FUNC_CTRL);
+		func_ctrl &= ~ULPI_FUNC_CTRL_OPMODE_MASK;
+		func_ctrl |= ULPI_FUNC_CTRL_OPMODE_NORMAL;
+		msm_ulpi_write(mhcd, func_ctrl, ULPI_FUNC_CTRL);
+	}
 
 	usb_hcd_resume_root_hub(hcd);
 	atomic_set(&mhcd->in_lpm, 0);
 
-	if (atomic_read(&mhcd->async_int)) {
-		atomic_set(&mhcd->async_int, 0);
+	if (mhcd->async_int) {
+		mhcd->async_int = false;
 		pm_runtime_put_noidle(mhcd->dev);
 		enable_irq(hcd->irq);
 	}
@@ -954,7 +931,7 @@ skip_phy_resume:
 		atomic_set(&mhcd->pm_usage_cnt, 0);
 		pm_runtime_put_noidle(mhcd->dev);
 	}
-	enable_irq(hcd->irq);
+
 	dev_info(mhcd->dev, "EHCI USB exited from low power mode\n");
 
 	return 0;
@@ -967,9 +944,9 @@ static irqreturn_t msm_ehci_irq(struct usb_hcd *hcd)
 
 	if (atomic_read(&mhcd->in_lpm)) {
 		dev_dbg(mhcd->dev, "phy async intr\n");
-                disable_irq_nosync(hcd->irq);
-		atomic_set(&mhcd->async_int, 1);
-                pm_runtime_get(mhcd->dev);
+		disable_irq_nosync(hcd->irq);
+		mhcd->async_int = true;
+		pm_runtime_get(mhcd->dev);
 		return IRQ_HANDLED;
 	}
 
@@ -1076,150 +1053,22 @@ static int msm_ehci_reset(struct usb_hcd *hcd)
 		writel_relaxed(readl_relaxed(USB_PHY_CTRL2) | (1<<16),
 								USB_PHY_CTRL2);
 
-	if (pdata && pdata->sw_fpr_ctrl)
-		writel_relaxed(readl(USB_GENCONFIG2) | (1<<17), USB_GENCONFIG2);		
-
 	ehci_port_power(ehci, 1);
 	return 0;
 }
 
 static int msm_ehci_bus_resume_with_gpio(struct usb_hcd *hcd)
 {
-	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
-	u32			temp;
-	u32			power_okay;
-	unsigned long		resume_needed = 0;
 	struct msm_hcd *mhcd = hcd_to_mhcd(hcd);
-	struct msm_usb_host_platform_data *pdata = mhcd->dev->platform_data;
+	int ret;
 
-	if (mhcd->resume_gpio) 
-		gpio_direction_output(mhcd->resume_gpio, 1);
-	
-	if(pdata && !pdata->sw_fpr_ctrl) {
-		ehci_bus_resume(hcd);
+	gpio_direction_output(mhcd->resume_gpio, 1);
 
-	} else {
-		if (time_before (jiffies, ehci->next_statechange))
-			msleep(5);
-		spin_lock_irq (&ehci->lock);
-		if (!HCD_HW_ACCESSIBLE(hcd)) {
-			spin_unlock_irq(&ehci->lock);
-			return -ESHUTDOWN;
-		}
+	ret = ehci_bus_resume(hcd);
 
-		if (unlikely(ehci->debug)) {
-			if (!dbgp_reset_prep())
-				ehci->debug = NULL;
-			else
-				dbgp_external_startup();
-		}
+	gpio_direction_output(mhcd->resume_gpio, 0);
 
-		/* Ideally and we've got a real resume here, and no port's power
-		 * was lost.  (For PCI, that means Vaux was maintained.)  But we
-		 * could instead be restoring a swsusp snapshot -- so that BIOS was
-		 * the last user of the controller, not reset/pm hardware keeping
-		 * state we gave to it.
-		 */
-		power_okay = ehci_readl(ehci, &ehci->regs->intr_enable);
-		ehci_dbg(ehci, "resume root hub%s\n",
-				power_okay ? "" : " after power loss");
-
-		/* at least some APM implementations will try to deliver
-		 * IRQs right away, so delay them until we're ready.
-		 */
-		ehci_writel(ehci, 0, &ehci->regs->intr_enable);
-
-		/* re-init operational registers */
-		ehci_writel(ehci, 0, &ehci->regs->segment);
-		ehci_writel(ehci, ehci->periodic_dma, &ehci->regs->frame_list);
-		ehci_writel(ehci, (u32) ehci->async->qh_dma, &ehci->regs->async_next);
-
-		/*CMD_RUN will be set after, PORT_RESUME gets cleared*/
-		if (ehci->resume_sof_bug){
-			temp = ehci_readl(ehci, &ehci->regs->port_status [0]);
-			if (temp & PORT_PE)
-				ehci->command &= ~CMD_RUN;
-		}
-
-		/* restore CMD_RUN, framelist size, and irq threshold */
-		ehci_writel(ehci, ehci->command, &ehci->regs->command);
-		ehci->rh_state = EHCI_RH_RUNNING;
-
-		temp = ehci_readl(ehci, &ehci->regs->port_status [0]);
-		temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
-		if (test_bit(0, &ehci->bus_suspended) &&
-				(temp & PORT_SUSPEND)) {
-			temp |= PORT_RESUME;
-			set_bit(0, &resume_needed);
-		}
-		ehci_writel(ehci, temp, &ehci->regs->port_status [0]);
-		
-		if (resume_needed && ehci->resume_sof_bug) {
-
-			spin_unlock_irq(&ehci->lock);
-			msleep(20);
-			spin_lock_irq(&ehci->lock);
-			temp = ehci_readl(ehci, &ehci->regs->port_status [0]);
-			temp &= ~(PORT_RWC_BITS | PORT_RESUME);
-			ehci_writel(ehci, temp, &ehci->regs->port_status [0]);
-
-			ehci_writel(ehci, ehci_readl(ehci,
-					&ehci->regs->command) | CMD_RUN,
-					&ehci->regs->command);
-
-			goto skip_clear_resume;
-		
-		}
-
-		/* msleep for 20ms only if code is trying to resume port */
-		if (resume_needed) {
-			spin_unlock_irq(&ehci->lock);
-			msleep(20);
-			spin_lock_irq(&ehci->lock);
-		}
-
-		temp = ehci_readl(ehci, &ehci->regs->port_status [0]);
-		if (test_bit(0, &resume_needed)) {
-			temp &= ~(PORT_RWC_BITS | PORT_RESUME);
-			ehci_writel(ehci, temp, &ehci->regs->port_status [0]);
-			ehci_vdbg (ehci, "resumed port 0\n");
-		}
-
-	skip_clear_resume:
-		(void) ehci_readl(ehci, &ehci->regs->command);
-
-		/* maybe re-activate the schedule(s) */
-		temp = 0;
-		if (ehci->async->qh_next.qh)
-			temp |= CMD_ASE;
-		if (ehci->periodic_sched)
-			temp |= CMD_PSE;
-		if (temp) {
-			ehci->command |= temp;
-			ehci_writel(ehci, ehci->command, &ehci->regs->command);
-		}
-
-		ehci->next_statechange = jiffies + msecs_to_jiffies(5);
-
-		/* Now we can safely re-enable irqs */
-		ehci_writel(ehci, INTR_MASK, &ehci->regs->intr_enable);
-
-		spin_unlock_irq (&ehci->lock);
-		ehci_handover_companion_ports(ehci);
-	}
-
-	if (mhcd->resume_gpio) 
-		gpio_direction_output(mhcd->resume_gpio, 0);
-
-	return 0;
-}
-
-static void ehci_reset_resume_check(struct usb_hcd *hcd)
-{
-	char *reset_resume[2]   = {"QMI_STATE=RESET_RESUME", NULL};
-
-	kobject_uevent_env(&hcd->self.controller->kobj, KOBJ_CHANGE,
-					reset_resume);
+	return ret;
 }
 
 #if defined(CONFIG_DEBUG_FS)
@@ -1351,14 +1200,6 @@ static int ehci_debugfs_init(struct msm_hcd *mhcd)
 }
 #endif
 
-static void ehci_set_autosuspend_delay(struct usb_device *dev)
-{
-	if (!dev->parent) /* no delay for RH */
-		pm_runtime_set_autosuspend_delay(&dev->dev, 0);
-	else
-		pm_runtime_set_autosuspend_delay(&dev->dev, 4000);
-}
-
 static struct hc_driver msm_hc2_driver = {
 	.description		= hcd_name,
 	.product_desc		= "Qualcomm EHCI Host Controller",
@@ -1403,8 +1244,6 @@ static struct hc_driver msm_hc2_driver = {
 	 */
 	.bus_suspend		= ehci_bus_suspend,
 	.bus_resume		= ehci_bus_resume,
-	.set_autosuspend_delay  = ehci_set_autosuspend_delay,
-	.reset_resume_handler = ehci_reset_resume_check,
 };
 
 static irqreturn_t msm_hsusb_wakeup_irq(int irq, void *data)
@@ -1413,7 +1252,7 @@ static irqreturn_t msm_hsusb_wakeup_irq(int irq, void *data)
 	int ret;
 
 	mhcd->wakeup_int_cnt++;
-	dev_dbg(mhcd->dev, "%s: ehci remote wakeup interrupt cnt: %u\n",
+	dev_dbg(mhcd->dev, "%s: hsic remote wakeup interrupt cnt: %u\n",
 			__func__, mhcd->wakeup_int_cnt);
 
 	pm_stay_awake(mhcd->dev);
@@ -1525,8 +1364,6 @@ struct msm_usb_host_platform_data *ehci_msm2_dt_to_pdata(
 
 	pdata->use_sec_phy = of_property_read_bool(node,
 					"qcom,usb2-enable-hsphy2");
-	pdata->pd_rework_installed = of_property_read_bool(node,
-					"qcom,usb2-ehci-pd-installed");
 	of_property_read_u32(node, "qcom,usb2-power-budget",
 					&pdata->power_budget);
 	pdata->no_selective_suspend = of_property_read_bool(node,
@@ -1534,12 +1371,9 @@ struct msm_usb_host_platform_data *ehci_msm2_dt_to_pdata(
 	pdata->resume_gpio = of_get_named_gpio(node, "qcom,resume-gpio", 0);
 	if (pdata->resume_gpio < 0)
 		pdata->resume_gpio = 0;
-	of_property_read_u32(node, "qcom,usb2-bus-num",
-					&pdata->fixed_bus_num);
-	pdata->phy_sof_workaround = of_property_read_bool(node,
-					"qcom,phy-sof-workaround");
-	pdata->sw_fpr_ctrl = of_property_read_bool(node,
-					"qcom,sw-fpr-control");
+	pdata->is_uicc = of_property_read_bool(node,
+					"qcom,usb2-enable-uicc");
+
 	return pdata;
 }
 
@@ -1555,8 +1389,12 @@ static int __devinit ehci_msm2_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "ehci_msm2 probe\n");
 
-	/* If there is no WAN device present, we don't need to start the EHCI stack */
-	if(!wan_present())
+	/*
+	 * Fail probe in case of uicc till userspace activates driver through
+	 * sysfs entry.
+	 */
+	if (!uicc_card_present && pdev->dev.of_node && of_property_read_bool(
+				pdev->dev.of_node, "qcom,usb2-enable-uicc"))
 		return -ENODEV;
 
 	if (pdev->dev.of_node) {
@@ -1700,22 +1538,19 @@ static int __devinit ehci_msm2_probe(struct platform_device *pdev)
 		goto disable_ldo;
 	}
 
+	pdata = mhcd->dev->platform_data;
+
+	if (pdata && pdata->use_sec_phy)
+		mhcd->usb_phy_ctrl_reg = USB_PHY_CTRL2;
+	else
+		mhcd->usb_phy_ctrl_reg = USB_PHY_CTRL;
+
 	ret = msm_hsusb_reset(mhcd);
 	if (ret) {
 		dev_err(&pdev->dev, "hsusb PHY initialization failed\n");
 		goto vbus_deinit;
 	}
 
-	pdata = mhcd->dev->platform_data;
-	if( pdata && pdata->phy_sof_workaround) {
-		/* defer bus suspend until RH suspend */
-		mhcd->ehci.susp_sof_bug = 1;
-		mhcd->ehci.resume_sof_bug = 1;
-	}
-
-	if (pdata && pdata->fixed_bus_num)
-		hcd->fixed_bus_num = pdata->fixed_bus_num;
-	
 	ret = usb_add_hcd(hcd, hcd->irq, IRQF_SHARED);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to register HCD\n");
@@ -1775,10 +1610,6 @@ static int __devinit ehci_msm2_probe(struct platform_device *pdev)
 			mhcd->pmic_gpio_dp_irq = 0;
 		}
 	}
-
-	if (pdata && pdata->pd_rework_installed)
-		mhcd->flags |= 	ALLOW_EHCI_RETENTION;
-
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
@@ -1825,13 +1656,6 @@ static int __devexit ehci_msm2_remove(struct platform_device *pdev)
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 	struct msm_hcd *mhcd = hcd_to_mhcd(hcd);
 
-	msm_ehci_resume(mhcd);
-	if (pdev->dev.power.power_state.event != PM_EVENT_INVALID)
-		pm_runtime_disable(&pdev->dev);
-	
-	device_init_wakeup(&pdev->dev, 0);
-	pm_runtime_set_suspended(&pdev->dev);
-	
 	if (mhcd->pmic_gpio_dp_irq) {
 		if (mhcd->pmic_gpio_dp_irq_enabled)
 			disable_irq_wake(mhcd->pmic_gpio_dp_irq);
@@ -1849,8 +1673,15 @@ static int __devexit ehci_msm2_remove(struct platform_device *pdev)
 		free_irq(mhcd->wakeup_irq, mhcd);
 	}
 
-	if(mhcd->resume_gpio)
-		gpio_free(mhcd->resume_gpio);	
+	if (mhcd->resume_gpio)
+		gpio_free(mhcd->resume_gpio);
+
+	/* If the device was removed no need to call pm_runtime_disable */
+	if (pdev->dev.power.power_state.event != PM_EVENT_INVALID)
+		pm_runtime_disable(&pdev->dev);
+
+	device_init_wakeup(&pdev->dev, 0);
+	pm_runtime_set_suspended(&pdev->dev);
 
 	usb_remove_hcd(hcd);
 
@@ -1885,8 +1716,7 @@ static int ehci_msm2_pm_suspend(struct device *dev)
 
 	dev_dbg(dev, "ehci-msm2 PM suspend\n");
 
-	if (device_may_wakeup(dev) && !mhcd->async_irq && !mhcd->wakeup_irq &&
-						!mhcd->pmic_gpio_dp_irq)
+	if (device_may_wakeup(dev))
 		enable_irq_wake(hcd->irq);
 
 	return msm_ehci_suspend(mhcd);
@@ -1901,14 +1731,8 @@ static int ehci_msm2_pm_resume(struct device *dev)
 
 	dev_dbg(dev, "ehci-msm2 PM resume\n");
 
-	if (device_may_wakeup(dev) && !mhcd->async_irq && !mhcd->wakeup_irq &&
-						!mhcd->pmic_gpio_dp_irq)
+	if (device_may_wakeup(dev))
 		disable_irq_wake(hcd->irq);
-
-	if (!atomic_read(&mhcd->pm_usage_cnt) &&
-		!atomic_read(&mhcd->async_int) &&
-		pm_runtime_suspended(dev))
-		return 0;
 
 	ret = msm_ehci_resume(mhcd);
 	if (ret)

@@ -191,6 +191,20 @@ enum usb_vdd_value {
 };
 
 /**
+ * Maintain state for hvdcp external charger status
+ * DEFAULT	This is used when DCP is detected
+ * ACTIVE	This is used when ioctl is called to block LPM
+ * INACTIVE	This is used when ioctl is called to unblock LPM
+ */
+
+enum usb_ext_chg_status {
+	DEFAULT = 1,
+	ACTIVE,
+	INACTIVE,
+};
+
+
+/**
  * struct msm_otg_platform_data - platform device data
  *              for msm_otg driver.
  * @phy_init_seq: PHY configuration sequence. val, reg pairs
@@ -324,6 +338,10 @@ struct msm_otg_platform_data {
  * @regs: ioremapped register base address.
  * @inputs: OTG state machine inputs(Id, SessValid etc).
  * @sm_work: OTG state machine work.
+ * @pm_suspended: OTG device is system(PM) suspended.
+ * @pm_notify: Notifier to receive system wide PM transition events.
+		It is used to defer wakeup events processing until
+		system is RESUMED.
  * @in_lpm: indicates low power mode (LPM) state.
  * @async_int: IRQ line on which ASYNC interrupt arrived in LPM.
  * @cur_power: The amount of mA available from downstream port.
@@ -387,6 +405,7 @@ struct msm_otg {
 	struct work_struct sm_work;
 	bool sm_work_pending;
 	atomic_t pm_suspended;
+	struct notifier_block pm_notify;
 	atomic_t in_lpm;
 	int async_int;
 	unsigned cur_power;
@@ -463,7 +482,7 @@ struct msm_otg {
 	struct class *ext_chg_class;
 	struct device *ext_chg_device;
 	bool ext_chg_opened;
-	bool ext_chg_active;
+	enum usb_ext_chg_status ext_chg_active;
 	struct completion ext_chg_wait;
 	int ui_enabled;
 	bool pm_done;
@@ -488,8 +507,6 @@ struct ci13xxx_platform_data {
  * @phy_sof_workaround: Enable ALL PHY SOF bug related workarounds for
 		SUSPEND, RESET and RESUME.
  * @phy_susp_sof_workaround: Enable PHY SOF workaround only for SUSPEND.
- * @dis_internal_clk_gating: if set, internal clock gating in controller
- * 			is disabled
  *
  */
 struct msm_hsic_host_platform_data {
@@ -497,17 +514,13 @@ struct msm_hsic_host_platform_data {
 	unsigned data;
 	bool ignore_cal_pad_config;
 	bool phy_sof_workaround;
-	bool dis_internal_clk_gating;
 	bool phy_susp_sof_workaround;
-	bool phy_reset_sof_workaround;
-	bool enable_autoresume;
 	u32 reset_delay;
 	int strobe_pad_offset;
 	int data_pad_offset;
 
 	struct msm_bus_scale_pdata *bus_scale_table;
 	unsigned log2_irq_thresh;
-	unsigned max_log2_irq_thresh;
 
 	/* gpio used to resume peripheral */
 	unsigned resume_gpio;
@@ -527,17 +540,12 @@ struct msm_hsic_host_platform_data {
 
 struct msm_usb_host_platform_data {
 	unsigned int power_budget;
-	unsigned int fixed_bus_num;
 	int pmic_gpio_dp_irq;
 	unsigned int dock_connect_irq;
 	bool use_sec_phy;
 	bool no_selective_suspend;
 	int resume_gpio;
-	u8 phy_type;
-	bool pd_rework_installed;
-	
-	bool phy_sof_workaround;
-	bool sw_fpr_ctrl;;
+	bool is_uicc;
 };
 
 /**

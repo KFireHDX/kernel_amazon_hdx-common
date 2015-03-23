@@ -2733,11 +2733,9 @@ static int finish_port_resume(struct usb_device *udev)
 int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 {
 	struct usb_hub	*hub = hdev_to_hub(udev->parent);
-	struct usb_device *hdev;
 	int		port1 = udev->portnum;
 	int		status;
 	u16		portchange, portstatus;
-	struct usb_hcd	*hcd;
 
 	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	status = hub_port_status(hub, port1, &portstatus, &portchange);
@@ -2797,15 +2795,6 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 	if (status < 0) {
 		dev_dbg(&udev->dev, "can't resume, status %d\n", status);
 		hub_port_logical_disconnect(hub, port1);
-
-		if (udev->reset_resume && udev->persist_enabled
-					&& hub->hdev){
-			hdev = hub->hdev;
-			hcd = bus_to_hcd(hdev->bus);
-			if (hcd->driver->reset_resume_handler)
-				hcd->driver->reset_resume_handler(hcd);
-		}
-
 	} else  {
 		/* Try to enable USB2 hardware LPM */
 		if (udev->usb2_hw_lpm_capable == 1)
