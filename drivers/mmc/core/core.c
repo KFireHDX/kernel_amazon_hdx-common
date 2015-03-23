@@ -244,10 +244,6 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
 			cmd->resp[0], cmd->resp[1],
 			cmd->resp[2], cmd->resp[3]);
 
-               trace_mmc_req_done( mmc_hostname(host), cmd->opcode, err,
-                       cmd->resp[0], cmd->resp[1],
-                       cmd->resp[2], cmd->resp[3]);
-
 		if (mrq->data) {
 #ifdef CONFIG_MMC_PERF_PROFILING
 			if (host->perf_enable) {
@@ -296,8 +292,6 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 	unsigned int i, sz;
 	struct scatterlist *sg;
 #endif
-        unsigned int blksz = 0;
-        unsigned int blocks = 0;
 
 	if (mrq->sbc) {
 		pr_debug("<%s: starting CMD%u arg %08x flags %08x>\n",
@@ -316,12 +310,7 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 			mrq->data->blocks, mrq->data->flags,
 			mrq->data->timeout_ns / 1000000,
 			mrq->data->timeout_clks);
-               blksz = mrq->data->blksz;
-               blocks = mrq->data->blocks;
 	}
-
-       trace_mmc_start_req( mmc_hostname(host), mrq->cmd->opcode,
-                            mrq->cmd->arg, mrq->cmd->flags, blksz, blocks);
 
 	if (mrq->stop) {
 		pr_debug("%s:     CMD%u arg %08x flags %08x\n",
@@ -627,8 +616,10 @@ static bool mmc_should_stop_curr_req(struct mmc_host *host)
 	    (host->areq->cmd_flags & REQ_FUA))
 		return false;
 
+	mmc_host_clk_hold(host);
 	remainder = (host->ops->get_xfer_remain) ?
 		host->ops->get_xfer_remain(host) : -1;
+	mmc_host_clk_release(host);
 	return (remainder > 0);
 }
 
@@ -653,6 +644,7 @@ static int mmc_stop_request(struct mmc_host *host)
 				mmc_hostname(host));
 		return -ENOTSUPP;
 	}
+	mmc_host_clk_hold(host);
 	err = host->ops->stop_request(host);
 	if (err) {
 		pr_err("%s: Call to host->ops->stop_request() failed (%d)\n",
@@ -687,6 +679,7 @@ static int mmc_stop_request(struct mmc_host *host)
 		goto out;
 	}
 out:
+	mmc_host_clk_release(host);
 	return err;
 }
 
@@ -709,11 +702,11 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
 	struct mmc_context_info *context_info = &host->context_info;
 	bool pending_is_urgent = false;
 	bool is_urgent = false;
-	int err;
+	int err, ret;
 	unsigned long flags;
 
 	while (1) {
-		wait_io_event_interruptible(context_info->wait,
+		ret = wait_io_event_interruptible(context_info->wait,
 				(context_info->is_done_rcv ||
 				 context_info->is_new_req  ||
 				 context_info->is_urgent));
@@ -766,7 +759,7 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
 				err = MMC_BLK_NEW_REQUEST;
 				break; /* return err */
 			}
-		} else {
+		} else if (context_info->is_urgent) {
 			/*
 			 * The case when block layer sent next urgent
 			 * notification before it receives end_io on
@@ -818,6 +811,11 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
 				pending_is_urgent = true;
 				continue; /* wait for done/new/urgent event */
 			}
+		} else {
+			pr_warn("%s: mmc thread unblocked from waiting by signal, ret=%d\n",
+					mmc_hostname(host),
+					ret);
+			continue;
 		}
 	} /* while */
 	return err;
@@ -1023,6 +1021,10 @@ EXPORT_SYMBOL(mmc_start_req);
  */
 void mmc_wait_for_req(struct mmc_host *host, struct mmc_request *mrq)
 {
+#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
+	if (mmc_bus_needs_resume(host))
+		mmc_resume_bus(host);
+#endif
 	__mmc_start_req(host, mrq);
 	mmc_wait_for_req_done(host, mrq);
 }
@@ -2051,9 +2053,6 @@ int mmc_resume_bus(struct mmc_host *host)
 		host->bus_ops->resume(host);
 	}
 
-	if (host->bus_ops->detect && !host->bus_dead)
-		host->bus_ops->detect(host);
-
 	mmc_bus_put(host);
 	printk("%s: Deferred resume completed\n", mmc_hostname(host));
 	return 0;
@@ -2454,16 +2453,6 @@ int mmc_erase(struct mmc_card *card, unsigned int from, unsigned int nr,
 	if (to <= from)
 		return -EINVAL;
 
-	/* address alignment to 8K (16 sector) */
-	if (arg == MMC_TRIM_ARG) {
-		if ((from % 16) != 0)
-			from = ((from >> 4) + 1) << 4;
-
-		to = (to >> 4) << 4;
-		if (from >= to)
-			return 0;
-	}
-
 	/* 'from' and 'to' are inclusive */
 	to -= 1;
 
@@ -2675,11 +2664,9 @@ static int mmc_do_hw_reset(struct mmc_host *host, int check)
 	mmc_host_clk_hold(host);
 	mmc_set_clock(host, host->f_init);
 
-	if (mmc_card_mmc(card) && host->ops->hw_reset) {
+	if (mmc_card_mmc(card) && host->ops->hw_reset)
 		host->ops->hw_reset(host);
-		pr_info("%s: %s: starting CMD recovery mode\n", mmc_hostname(host), __func__);
-		
-	} else
+	else
 		mmc_power_cycle(host);
 
 	/* If the reset has happened, then a status command will fail */
@@ -3146,6 +3133,19 @@ int _mmc_detect_card_removed(struct mmc_host *host)
 		return 1;
 
 	ret = host->bus_ops->alive(host);
+
+	/*
+	 * Card detect status and alive check may be out of sync if card is
+	 * removed slowly, when card detect switch changes while card/slot
+	 * pads are still contacted in hardware (refer to "SD Card Mechanical
+	 * Addendum, Appendix C: Card Detection Switch"). So reschedule a
+	 * detect work 200ms later for this case.
+	 */
+	if (!ret && host->ops->get_cd && !host->ops->get_cd(host)) {
+		mmc_detect_change(host, msecs_to_jiffies(200));
+		pr_debug("%s: card removed too slowly\n", mmc_hostname(host));
+	}
+
 	if (ret) {
 		mmc_card_set_removed(host->card);
 		pr_debug("%s: card remove detected\n", mmc_hostname(host));
@@ -3246,8 +3246,12 @@ void mmc_rescan(struct work_struct *work)
 	 */
 	mmc_bus_put(host);
 
-	if (host->ops->get_cd && host->ops->get_cd(host) == 0)
+	if (host->ops->get_cd && host->ops->get_cd(host) == 0) {
+		mmc_claim_host(host);
+		mmc_power_off(host);
+		mmc_release_host(host);
 		goto out;
+	}
 
 	mmc_rpm_hold(host, &host->class_dev);
 	mmc_claim_host(host);

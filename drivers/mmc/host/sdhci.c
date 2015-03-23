@@ -32,15 +32,14 @@
 #include "sdhci.h"
 
 #define DRIVER_NAME "sdhci"
+#define SDHCI_SUSPEND_TIMEOUT 300 /* 300 ms */
 
 #define DBG(f, x...) \
 	pr_debug(DRIVER_NAME " [%s()]: " f, __func__,## x)
 
 #if defined(CONFIG_LEDS_CLASS) || (defined(CONFIG_LEDS_CLASS_MODULE) && \
 	defined(CONFIG_MMC_SDHCI_MODULE))
-#if !defined(CONFIG_ARCH_MSM8974_THOR) && !defined(CONFIG_ARCH_MSM8974_APOLLO) && !defined(CONFIG_MACH_URSA)
 #define SDHCI_USE_LEDS_CLASS
-#endif
 #endif
 
 #define MAX_TUNING_LOOP 40
@@ -70,94 +69,11 @@ static inline int sdhci_runtime_pm_put(struct sdhci_host *host)
 }
 #endif
 
-void sdhci_trace_write(struct sdhci_host *host, int in_irq,
-			const char *fmt, ...)
+static inline int sdhci_get_async_int_status(struct sdhci_host *host)
 {
-	u64 ts = 0;
-	unsigned int idx;
-	va_list args;
-	struct sdhci_trace_event *event;
-
-	if (!(host->quirks2 & SDHCI_QUIRK2_TRACE_ON))
-		return;
-
-	if (!host->trace_buf.rbuf)
-		return;
-
-	/* To prevent taking a spinlock here an atomic increment
-	 * is used, and modulus is used to keep index within
-	 * array bounds. The cast to unsigned is necessary so
-	 * increment and rolover wraps to 0 correctly
-	 */
-	idx = ((unsigned int)atomic_inc_return(&host->trace_buf.wr_idx)) &
-			(SDHCI_TRACE_RBUF_NUM_EVENTS - 1);
-
-	/* Catch some unlikely machine specific wrap-around bug */
-	if (unlikely(idx > (SDHCI_TRACE_RBUF_NUM_EVENTS - 1)))
-		return;
-
-	/* No timestamp in irq to speed up logging as cpu_clock()
-	 * may have barriers
-	 */
-	if (!in_irq)
-		ts = cpu_clock(0);
-
-	event = &host->trace_buf.rbuf[idx];
-	va_start(args, fmt);
-	vscnprintf(event->data, SDHCI_TRACE_EVENT_DATA_SZ, fmt, args);
-	va_end(args);
+	return (sdhci_readw(host, SDHCI_HOST_CONTROL2) &
+		 SDHCI_CTRL_ASYNC_INT_ENABLE) >> 14;
 }
-
-#define SDHCI_TRACE(host, fmt, ...) \
-		sdhci_trace_write(host, 0, fmt, ##__VA_ARGS__);
-#define SDHCI_TRACE_IRQ(host, fmt, ...) \
-		sdhci_trace_write(host, 0, fmt, ##__VA_ARGS__);
-
-static void sdhci_trace_init(struct sdhci_host *host)
-{
-	BUILD_BUG_ON_NOT_POWER_OF_2(SDHCI_TRACE_RBUF_NUM_EVENTS);
-
-
-	host->trace_buf.rbuf = (struct sdhci_trace_event *)
-				__get_free_pages(GFP_KERNEL|__GFP_ZERO,
-				SDHCI_TRACE_RBUF_SZ_ORDER);
-
-	if (!host->trace_buf.rbuf) {
-		pr_err("Unable to allocate trace for sdhci\n");
-		return;
-	}
-
-	atomic_set(&host->trace_buf.wr_idx, -1);
-}
-
-static void sdhci_dump_irq_buffer(struct sdhci_host *host)
-{
-	unsigned int idx, l;
-	unsigned int N = SDHCI_TRACE_RBUF_NUM_EVENTS - 1;
-	struct sdhci_trace_event *event;
-
-	if (!(host->quirks2 & SDHCI_QUIRK2_TRACE_ON))
-		return;
-
-	if (!host->trace_buf.rbuf)
-		return;
-
-	idx = ((unsigned int)atomic_read(&host->trace_buf.wr_idx)) & N;
-	l = (idx + 1) & N;
-
-	do {
-		event = &host->trace_buf.rbuf[l];
-		pr_info("%s", (char *)event->data);
-		l = (l + 1) & N;
-		if (l == idx) {
-			event = &host->trace_buf.rbuf[l];
-			pr_info("%s", (char *)event->data);
-			break;
-		}
-	} while (1);
-}
-
-
 
 static void sdhci_dump_state(struct sdhci_host *host)
 {
@@ -225,13 +141,7 @@ static void sdhci_dumpregs(struct sdhci_host *host)
 		       readl(host->ioaddr + SDHCI_ADMA_ADDRESS));
 
 	sdhci_dump_state(host);
-	sdhci_dump_irq_buffer(host);
 	pr_info(DRIVER_NAME ": ===========================================\n");
-
-#if !defined(CONFIG_ARCH_MSM8974_THOR) && !defined(CONFIG_ARCH_MSM8974_APOLLO)
-	panic("%s: EMMC Card Error!", mmc_hostname(host->mmc));	
-#endif
-
 }
 
 #define MAX_PM_QOS_TIMEOUT_VALUE	100000 /* 100 ms */
@@ -1064,10 +974,6 @@ static void sdhci_prepare_data(struct sdhci_host *host, struct mmc_command *cmd)
 	sdhci_writew(host, SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG,
 		data->blksz), SDHCI_BLOCK_SIZE);
 	sdhci_writew(host, data->blocks, SDHCI_BLOCK_COUNT);
-	SDHCI_TRACE_IRQ(host, "%lld: %s: 0x28=0x%08x 0x3E=0x%08x\n",
-			ktime_to_ms(ktime_get()), __func__,
-			sdhci_readb(host, SDHCI_HOST_CONTROL),
-			sdhci_readw(host, SDHCI_HOST_CONTROL2));
 }
 
 static void sdhci_set_transfer_mode(struct sdhci_host *host,
@@ -1118,9 +1024,6 @@ static void sdhci_finish_data(struct sdhci_host *host)
 	data = host->data;
 	host->data = NULL;
 
-	SDHCI_TRACE_IRQ(host, "%lld: %s: 0x24=0x%08x",
-			ktime_to_ms(ktime_get()), __func__,
-			sdhci_readl(host, SDHCI_PRESENT_STATE));
 	if (host->flags & SDHCI_REQ_USE_DMA) {
 		if (host->flags & SDHCI_USE_ADMA)
 			sdhci_adma_table_post(host, data);
@@ -1248,12 +1151,6 @@ static void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 	if (cmd->data)
 		host->data_start_time = ktime_get();
 	sdhci_writew(host, SDHCI_MAKE_CMD(cmd->opcode, flags), SDHCI_COMMAND);
-	SDHCI_TRACE_IRQ(host, "%lld: %s: updated 0x8=0x%08x 0xC=0x%08x 0xE=0x%08x\n",
-			ktime_to_ms(ktime_get()), __func__,
-			sdhci_readl(host, SDHCI_ARGUMENT),
-			sdhci_readl(host, SDHCI_TRANSFER_MODE),
-			sdhci_readl(host, SDHCI_COMMAND));
-
 }
 
 static void sdhci_finish_command(struct sdhci_host *host)
@@ -1690,6 +1587,33 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	spin_unlock_irqrestore(&host->lock, flags);
 }
 
+static void sdhci_cfg_async_intr(struct sdhci_host *host, bool enable)
+{
+	if (!host->async_int_supp)
+		return;
+
+	if (enable)
+		sdhci_writew(host,
+			     sdhci_readw(host, SDHCI_HOST_CONTROL2) |
+			     SDHCI_CTRL_ASYNC_INT_ENABLE,
+			     SDHCI_HOST_CONTROL2);
+	else
+		sdhci_writew(host, sdhci_readw(host, SDHCI_HOST_CONTROL2) &
+			     ~SDHCI_CTRL_ASYNC_INT_ENABLE,
+			     SDHCI_HOST_CONTROL2);
+}
+
+static void sdhci_cfg_irq(struct sdhci_host *host, bool enable)
+{
+	if (enable && !host->irq_enabled) {
+		enable_irq(host->irq);
+		host->irq_enabled = true;
+	} else if (!enable && host->irq_enabled) {
+		disable_irq_nosync(host->irq);
+		host->irq_enabled = false;
+	}
+}
+
 static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 {
 	unsigned long flags;
@@ -1705,9 +1629,26 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 		return;
 	}
 
-	if (ios->clock)
+	spin_lock_irqsave(&host->lock, flags);
+	/* lock is being released intermittently below, hence disable irq */
+	sdhci_cfg_irq(host, false);
+	spin_unlock_irqrestore(&host->lock, flags);
+	if (ios->clock) {
 		sdhci_set_clock(host, ios->clock);
-
+		if (host->async_int_supp && sdhci_get_async_int_status(host)) {
+			if (host->disable_sdio_irq_deferred) {
+				pr_debug("%s: %s: disable sdio irq\n",
+					 mmc_hostname(host->mmc), __func__);
+				host->mmc->ops->enable_sdio_irq(host->mmc, 0);
+				host->disable_sdio_irq_deferred = false;
+			}
+			spin_lock_irqsave(&host->lock, flags);
+			sdhci_cfg_async_intr(host, false);
+			spin_unlock_irqrestore(&host->lock, flags);
+			pr_debug("%s: %s: unconfig async intr\n",
+				 mmc_hostname(host->mmc), __func__);
+		}
+	}
 	/*
 	 * The controller clocks may be off during power-up and we may end up
 	 * enabling card clock before giving power to the card. Hence, during
@@ -1733,6 +1674,7 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 	}
 	spin_lock_irqsave(&host->lock, flags);
 	if (!host->clock) {
+		sdhci_cfg_irq(host, true);
 		spin_unlock_irqrestore(&host->lock, flags);
 		mutex_unlock(&host->ios_mutex);
 		return;
@@ -1892,9 +1834,18 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 		if (host->vmmc && vdd_bit != -1)
 			mmc_regulator_set_ocr(host->mmc, host->vmmc, vdd_bit);
 	}
-	if (!ios->clock)
+	if (!ios->clock) {
+		if (host->async_int_supp && host->mmc->card &&
+		    mmc_card_sdio(host->mmc->card)) {
+			sdhci_cfg_async_intr(host, true);
+			pr_debug("%s: %s: config async intr\n",
+				mmc_hostname(host->mmc), __func__);
+		}
 		sdhci_set_clock(host, ios->clock);
-
+	}
+	spin_lock_irqsave(&host->lock, flags);
+	sdhci_cfg_irq(host, true);
+	spin_unlock_irqrestore(&host->lock, flags);
 	mmiowb();
 	mutex_unlock(&host->ios_mutex);
 }
@@ -1973,6 +1924,14 @@ static void sdhci_enable_sdio_irq_nolock(struct sdhci_host *host, int enable)
 {
 	if (host->flags & SDHCI_DEVICE_DEAD)
 		goto out;
+
+	if (!enable && !host->clock) {
+		pr_debug("%s: %s: defered disabling card intr\n",
+			 host->mmc ? mmc_hostname(host->mmc) : "null",
+			 __func__);
+		host->disable_sdio_irq_deferred = true;
+		return;
+	}
 
 	if (enable)
 		host->flags |= SDHCI_SDIO_IRQ_ENABLED;
@@ -2634,8 +2593,6 @@ static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask)
 			host->cmd->error = -EILSEQ;
 	}
 
-	SDHCI_TRACE_IRQ(host, "%lld: %s: cmd-err intmask: 0x%x",
-				ktime_to_ms(ktime_get()), __func__, intmask);
 	if (host->cmd->error) {
 		command = SDHCI_GET_CMD(sdhci_readw(host,
 						    SDHCI_COMMAND));
@@ -2705,9 +2662,6 @@ static void sdhci_data_irq(struct sdhci_host *host, u32 intmask)
 	bool pr_msg = false;
 	BUG_ON(intmask == 0);
 
-	SDHCI_TRACE_IRQ(host, "%lld: %s: data-irq rxd: intmask: 0x%x\n",
-			ktime_to_ms(ktime_get()), __func__, intmask);
-
 	/* CMD19 generates _only_ Buffer Read Ready interrupt */
 	if (intmask & SDHCI_INT_DATA_AVAIL) {
 		command = SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND));
@@ -2739,17 +2693,6 @@ static void sdhci_data_irq(struct sdhci_host *host, u32 intmask)
 		pr_err("%s: Got data interrupt 0x%08x even "
 			"though no data operation was in progress.\n",
 			mmc_hostname(host->mmc), (unsigned)intmask);
-
-		/* if the interrupt is data CRC error, this indicates
-		 * a potential signal integrity issue of host, so do a
-		 * host reset on CMD/DATA to clear it up.
-		 */
-		if (intmask == SDHCI_INT_DATA_CRC) {
-			sdhci_reset(host, SDHCI_RESET_CMD);
-			sdhci_reset(host, SDHCI_RESET_DATA);
-			return;
-		}
-
 		sdhci_dumpregs(host);
 
 		return;
@@ -2852,6 +2795,23 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 		return IRQ_HANDLED;
 	}
 
+	if (!host->clock && host->mmc->card &&
+	    mmc_card_sdio(host->mmc->card)) {
+		/* SDIO async. interrupt is level-sensitive */
+		sdhci_cfg_irq(host, false);
+		pr_debug("%s: got async-irq: clocks: %d gated: %d host-irq[en:1/dis:0]: %d\n",
+			mmc_hostname(host->mmc), host->clock,
+			host->mmc->clk_gated, host->irq_enabled);
+		spin_unlock(&host->lock);
+		/* prevent suspend till the ksdioirqd runs or resume happens */
+		if ((host->mmc->dev_status == DEV_SUSPENDING) ||
+		    (host->mmc->dev_status == DEV_SUSPENDED))
+			pm_wakeup_event(&host->mmc->card->dev,
+					SDHCI_SUSPEND_TIMEOUT);
+		else
+			mmc_signal_sdio_irq(host->mmc);
+		return IRQ_HANDLED;
+	}
 	intmask = sdhci_readl(host, SDHCI_INT_STATUS);
 
 	if (!intmask || intmask == 0xffffffff) {
@@ -2860,9 +2820,6 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 	}
 
 again:
-        SDHCI_TRACE_IRQ(host, "%lld: %s: sdhci_irq rxd: intmask: 0x%x\n",
-              ktime_to_ms(ktime_get()), __func__, intmask);
-
 	DBG("*** %s got interrupt: 0x%08x\n",
 		mmc_hostname(host->mmc), intmask);
 
@@ -2950,11 +2907,13 @@ out:
 	/*
 	 * We have to delay this as it calls back into the driver.
 	 */
-	if (cardint)
+	if (cardint) {
+		/* clks are on, but suspend may be in progress */
+		if (host->mmc->dev_status == DEV_SUSPENDING)
+			pm_wakeup_event(&host->mmc->card->dev,
+					SDHCI_SUSPEND_TIMEOUT);
 		mmc_signal_sdio_irq(host->mmc);
-
-	SDHCI_TRACE_IRQ(host, "%lld: %s: updated: intmask: 0x%x\n",
-			ktime_to_ms(ktime_get()), __func__, intmask);
+	}
 	return result;
 }
 
@@ -3604,6 +3563,7 @@ int sdhci_add_host(struct sdhci_host *host)
 	if (ret)
 		goto untasklet;
 
+	host->irq_enabled = true;
 	host->vmmc = regulator_get(mmc_dev(mmc), "vmmc");
 	if (IS_ERR(host->vmmc)) {
 		pr_info("%s: no vmmc regulator found\n", mmc_hostname(mmc));
@@ -3647,10 +3607,12 @@ int sdhci_add_host(struct sdhci_host *host)
 					mmc_hostname(mmc), ret);
 	}
 
-	if (host->quirks2 & SDHCI_QUIRK2_TRACE_ON)
-		sdhci_trace_init(host);
+	if (caps[0] & SDHCI_ASYNC_INTR)
+		host->async_int_supp = true;
 	mmc_add_host(mmc);
 
+	if (host->quirks2 & SDHCI_QUIRK2_IGN_DATA_END_BIT_ERROR)
+		sdhci_clear_set_irqs(host, SDHCI_INT_DATA_END_BIT, 0);
 	pr_info("%s: SDHCI controller on %s [%s] using %s\n",
 		mmc_hostname(mmc), host->hw_name, dev_name(mmc_dev(mmc)),
 		(host->flags & SDHCI_USE_ADMA) ? "ADMA" :

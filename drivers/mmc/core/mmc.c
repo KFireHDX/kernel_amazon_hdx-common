@@ -19,19 +19,11 @@
 #include <linux/mmc/mmc.h>
 #include <linux/pm_runtime.h>
 #include <linux/reboot.h>
-#ifdef CONFIG_AMAZON_METRICS_LOG
-#include <linux/metricslog.h>
-#endif
+
 #include "core.h"
 #include "bus.h"
 #include "mmc_ops.h"
 #include "sd_ops.h"
-
-#define TOSHIBA_MANF_ID	0x11
-#define SAMSUNG_MANF_ID	0x15
-#define SANDISK_MANF_ID	0x45
-#define HYNIX_MANF_ID		0x90
-#define MICRON_MANF_ID		0xFE
 
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
@@ -73,6 +65,10 @@ static const struct mmc_fixup mmc_fixups[] = {
 	 */
 	MMC_FIXUP_EXT_CSD_REV(CID_NAME_ANY, CID_MANFID_HYNIX,
 			      0x014a, add_quirk, MMC_QUIRK_BROKEN_HPI, 5),
+
+	/* Disable HPI feature for Kingstone card */
+	MMC_FIXUP_EXT_CSD_REV("MMC16G", CID_MANFID_KINGSTON, CID_OEMID_ANY,
+			add_quirk, MMC_QUIRK_BROKEN_HPI, 5),
 
 	/*
 	 * Some Hynix cards exhibit data corruption over reboots if cache is
@@ -119,7 +115,7 @@ static int mmc_decode_cid(struct mmc_card *card)
 
 	case 2: /* MMC v2.0 - v2.2 */
 	case 3: /* MMC v3.1 - v3.3 */
-	case 4: /* MMC v4 - v4.51 */
+	case 4: /* MMC v4 */
 		card->cid.manfid	= UNSTUFF_BITS(resp, 120, 8);
 		card->cid.oemid		= UNSTUFF_BITS(resp, 104, 16);
 		card->cid.prod_name[0]	= UNSTUFF_BITS(resp, 96, 8);
@@ -131,12 +127,6 @@ static int mmc_decode_cid(struct mmc_card *card)
 		card->cid.serial	= UNSTUFF_BITS(resp, 16, 32);
 		card->cid.month		= UNSTUFF_BITS(resp, 12, 4);
 		card->cid.year		= UNSTUFF_BITS(resp, 8, 4) + 1997;
-		/* MMC v4 above only has product revision defined, which is
-		 * not in the mmc_cid data structure, to remain BC, let's
-		 * just use hwrev for the upper 4 bit of prod rev, and fwrev
-		 * for the lower 4 bit of prod rev */
-		card->cid.hwrev		= UNSTUFF_BITS(resp, 52, 4);
-		card->cid.fwrev		= UNSTUFF_BITS(resp, 48, 4);
 		break;
 
 	default:
@@ -210,33 +200,6 @@ static int mmc_decode_csd(struct mmc_card *card)
 	}
 
 	return 0;
-}
-
-char *mmc_decode_manf_id(struct mmc_card *card)
-{
-	u32 manufacturer_id;
-
-	manufacturer_id = UNSTUFF_BITS(card->raw_cid, 104, 24);
-	manufacturer_id = (manufacturer_id >> 16);
-
-	switch (manufacturer_id) {
-	case TOSHIBA_MANF_ID:
-		return "Toshiba";
-
-	case SAMSUNG_MANF_ID:
-		return "Samsung";
-
-	case HYNIX_MANF_ID:
-		return "Hynix";
-
-	case MICRON_MANF_ID:
-		return "Micron";
-
-	case SANDISK_MANF_ID:
-		return "Sandisk";
-	}
-
-	return "Unknown";
 }
 
 /*
@@ -391,6 +354,8 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 
 	card->ext_csd.raw_card_type = ext_csd[EXT_CSD_CARD_TYPE];
 	mmc_select_card_type(card);
+
+	card->ext_csd.raw_drive_strength = ext_csd[EXT_CSD_DRIVE_STRENGTH];
 
 	card->ext_csd.raw_s_a_timeout = ext_csd[EXT_CSD_S_A_TIMEOUT];
 	card->ext_csd.raw_erase_timeout_mult =
@@ -706,15 +671,6 @@ out:
 	return err;
 }
 
-static ssize_t mmc_manufacturer_show (struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct mmc_card *card = mmc_dev_to_card(dev);
-	return sprintf(buf, "%s", mmc_decode_manf_id(card));
-}
-
-static DEVICE_ATTR(manufacturer, S_IRUGO, mmc_manufacturer_show, NULL);
-
 MMC_DEV_ATTR(cid, "%08x%08x%08x%08x\n", card->raw_cid[0], card->raw_cid[1],
 	card->raw_cid[2], card->raw_cid[3]);
 MMC_DEV_ATTR(csd, "%08x%08x%08x%08x\n", card->raw_csd[0], card->raw_csd[1],
@@ -757,18 +713,8 @@ static struct attribute_group mmc_std_attr_group = {
 	.attrs = mmc_std_attrs,
 };
 
-static struct attribute *mmc_ext_attrs[] = {
-	&dev_attr_manufacturer.attr,
-	NULL,
-};
-
-static struct attribute_group mmc_ext_attr_group = {
-	.attrs = mmc_ext_attrs,
-};
-
 static const struct attribute_group *mmc_attr_groups[] = {
 	&mmc_std_attr_group,
-	&mmc_ext_attr_group,
 	NULL,
 };
 
@@ -815,9 +761,7 @@ static int mmc_select_powerclass(struct mmc_card *card,
 				EXT_CSD_PWR_CL_52_195 :
 				EXT_CSD_PWR_CL_DDR_52_195;
 		else if (host->ios.clock <= 200000000)
-			index = (bus_width <= EXT_CSD_BUS_WIDTH_8) ?
-				EXT_CSD_PWR_CL_200_195 :
-				EXT_CSD_PWR_CL_DDR_200_195;
+			index = EXT_CSD_PWR_CL_200_195;
 		break;
 	case MMC_VDD_27_28:
 	case MMC_VDD_28_29:
@@ -835,9 +779,9 @@ static int mmc_select_powerclass(struct mmc_card *card,
 				EXT_CSD_PWR_CL_52_360 :
 				EXT_CSD_PWR_CL_DDR_52_360;
 		else if (host->ios.clock <= 200000000)
-			index = (bus_width <= EXT_CSD_BUS_WIDTH_8) ?
-				EXT_CSD_PWR_CL_200_360 :
-				EXT_CSD_PWR_CL_DDR_200_360;
+			index = (bus_width == EXT_CSD_DDR_BUS_WIDTH_8) ?
+				EXT_CSD_PWR_CL_DDR_200_360 :
+				EXT_CSD_PWR_CL_200_360;
 		break;
 	default:
 		pr_warning("%s: Voltage range not supported "
@@ -1347,10 +1291,7 @@ static int mmc_reboot_notify(struct notifier_block *notify_block,
 	struct mmc_card *card = container_of(
 			notify_block, struct mmc_card, reboot_notify);
 
-	if (event != SYS_RESTART)
-		card->issue_long_pon = true;
-	else
-		card->issue_long_pon = false;
+	card->pon_type = (event != SYS_RESTART) ? MMC_LONG_PON : MMC_SHRT_PON;
 
 	return NOTIFY_OK;
 }
@@ -1398,9 +1339,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 	u32 cid[4];
 	u32 rocr;
 	u8 *ext_csd = NULL;
-#ifdef CONFIG_AMAZON_METRICS_LOG
-	char buf[128];
-#endif
+
 	BUG_ON(!host);
 	WARN_ON(!host->claimed);
 
@@ -1464,17 +1403,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		card->type = MMC_TYPE_MMC;
 		card->rca = 1;
 		memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
-
-#ifdef CONFIG_AMAZON_METRICS_LOG
-		snprintf(buf, sizeof(buf),
-			"emmc:def:vendor=%s;DV;1,host=%s;DV;1:NR",
-			mmc_decode_manf_id(card), mmc_hostname(host));
-		log_to_metrics(ANDROID_LOG_INFO, "emmc", buf);
-#endif
 		card->reboot_notify.notifier_call = mmc_reboot_notify;
-
-		printk(KERN_INFO "emmc: I def:mmcinfo:vendor=%s, host=%s:\n",
-			mmc_decode_manf_id(card), mmc_hostname(host));
 	}
 
 	/*
@@ -1660,11 +1589,6 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 			card->ext_csd.cache_ctrl = 1;
 		}
 	}
-	if (card->quirks & MMC_QUIRK_CACHE_DISABLE) {
-		pr_warn("%s: This is Hynix card, cache disabled!\n",
-				mmc_hostname(card->host));
-		card->ext_csd.cache_ctrl = 0;
-	}
 
 	if ((host->caps2 & MMC_CAP2_PACKED_WR &&
 			card->ext_csd.max_packed_writes > 0) ||
@@ -1763,19 +1687,24 @@ static int mmc_poweroff_notify(struct mmc_card *card, unsigned int notify_type)
 	return err;
 }
 
-int mmc_send_long_pon(struct mmc_card *card)
+int mmc_send_pon(struct mmc_card *card)
 {
 	int err = 0;
 	struct mmc_host *host = card->host;
 
+	if (!mmc_can_poweroff_notify(card))
+		goto out;
+
 	mmc_claim_host(host);
-	if (card->issue_long_pon && mmc_can_poweroff_notify(card)) {
+	if (card->pon_type & MMC_LONG_PON)
 		err = mmc_poweroff_notify(host->card, EXT_CSD_POWER_OFF_LONG);
-		if (err)
-			pr_warning("%s: error %d sending Long PON",
-					mmc_hostname(host), err);
-	}
+	else if (card->pon_type & MMC_SHRT_PON)
+		err = mmc_poweroff_notify(host->card, EXT_CSD_POWER_OFF_SHORT);
+	if (err)
+		pr_warn("%s: error %d sending PON type %u",
+			mmc_hostname(host), err, card->pon_type);
 	mmc_release_host(host);
+out:
 	return err;
 }
 
@@ -1788,11 +1717,12 @@ static void mmc_remove(struct mmc_host *host)
 	BUG_ON(!host->card);
 
 	unregister_reboot_notifier(&host->card->reboot_notify);
+
+	mmc_exit_clk_scaling(host);
 	mmc_remove_card(host->card);
 
 	mmc_claim_host(host);
 	host->card = NULL;
-	mmc_exit_clk_scaling(host);
 	mmc_release_host(host);
 }
 
