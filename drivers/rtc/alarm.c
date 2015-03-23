@@ -22,7 +22,6 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/wakelock.h>
-#include <linux/time.h>
 
 #include <asm/mach/time.h>
 
@@ -71,7 +70,6 @@ static struct wake_lock alarm_rtc_wake_lock;
 static struct platform_device *alarm_platform_dev;
 struct alarm_queue alarms[ANDROID_ALARM_TYPE_COUNT];
 static bool suspended;
-static bool rtc_wakeup;
 static long power_on_alarm;
 
 static int set_alarm_time_to_rtc(const long);
@@ -370,37 +368,18 @@ ktime_t alarm_get_elapsed_realtime(void)
 	return now;
 }
 
-
-void read_android_elapsed(struct timespec *ts)
-{
-	ktime_t kt;
-
-	kt = alarm_get_elapsed_realtime();
-	*ts = ktime_to_timespec(kt);
-}
-
 static enum hrtimer_restart alarm_timer_triggered(struct hrtimer *timer)
 {
 	struct alarm_queue *base;
 	struct alarm *alarm;
 	unsigned long flags;
 	ktime_t now;
-	bool is_wakeup;
-	unsigned int type_mask = 0;
 
 	spin_lock_irqsave(&alarm_slock, flags);
 
 	base = container_of(timer, struct alarm_queue, timer);
 	now = base->stopped ? base->stopped_time : hrtimer_cb_get_time(timer);
 	now = ktime_sub(now, base->delta);
-
-	is_wakeup = base == &alarms[ANDROID_ALARM_RTC_WAKEUP] ||
-			base == &alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP];
-
-	if (is_wakeup && rtc_wakeup) {
-		type_mask = ANDROID_ALARM_WAKEUP_TRIGGER_MASK;
-		rtc_wakeup = false;
-	}
 
 	pr_alarm(INT, "alarm_timer_triggered type %d at %lld\n",
 		base - alarms, ktime_to_ns(now));
@@ -421,7 +400,6 @@ static enum hrtimer_restart alarm_timer_triggered(struct hrtimer *timer)
 			ktime_to_ns(alarm->expires),
 			ktime_to_ns(alarm->softexpires));
 		spin_unlock_irqrestore(&alarm_slock, flags);
-		alarm->type |= type_mask;
 		alarm->function(alarm);
 		spin_lock_irqsave(&alarm_slock, flags);
 	}
@@ -435,16 +413,9 @@ static enum hrtimer_restart alarm_timer_triggered(struct hrtimer *timer)
 static void alarm_triggered_func(void *p)
 {
 	struct rtc_device *rtc = alarm_rtc_dev;
-	unsigned long flags;
-	ktime_t t;
-
 	if (!(rtc->irq_data & RTC_AF))
 		return;
 	pr_alarm(INT, "rtc alarm triggered\n");
-	spin_lock_irqsave(&alarm_slock, flags);
-	if (suspended && (pm_get_resume_ev(&t) == WEV_RTC))
-		rtc_wakeup = true;
-	spin_unlock_irqrestore(&alarm_slock, flags);
 	wake_lock_timeout(&alarm_rtc_wake_lock, 1 * HZ);
 }
 
@@ -552,6 +523,7 @@ static int alarm_resume(struct platform_device *pdev)
 									false);
 	spin_unlock_irqrestore(&alarm_slock, flags);
 
+	set_alarm_time_to_rtc(power_on_alarm);
 	return 0;
 }
 
